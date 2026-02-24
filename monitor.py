@@ -457,7 +457,9 @@ def registrar_webhook():
 def startup():
     """Roda em thread separada após Flask subir — garante Telegram."""
     time.sleep(3)  # aguarda Flask estar pronto
-    registrar_webhook()
+    # Webhook já registrado manualmente na Helius — não registrar automaticamente
+    # para evitar duplicatas a cada redeploy
+    # ID ativo: 7a74a111-fdd6-4b47-9f39-93ff20cf1349
     telegram(
         "🚀 <b>Monitor v5.1 iniciado!</b>\n\n"
         "Modo: <b>Webhook</b> — consumo mínimo\n\n"
