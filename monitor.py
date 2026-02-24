@@ -2,15 +2,19 @@ import requests
 import pandas as pd
 import time
 import threading
+import os
 from datetime import datetime
 from flask import Flask, request, jsonify
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║           MONITOR DE CARTEIRAS SOLANA — v5              ║
+# ║           MONITOR DE CARTEIRAS SOLANA — v5.1            ║
 # ║                                                          ║
-# ║  Arquitetura: Webhook (Helius avisa → sem polling)       ║
-# ║  Consumo: ~1 crédito por transação detectada             ║
-# ║  vs v4: 100 créditos por chamada a cada 30s              ║
+# ║  Correções:                                              ║
+# ║  • Tokens pré-migração: nome via Helius + MC estimado   ║
+# ║  • Telegram: disparo após Flask subir (thread)          ║
+# ║  • txns_t0 logado corretamente                          ║
+# ║  • Flag token_antigo quando idade > 1440min (1 dia)     ║
+# ║  • Deduplicação de assinaturas                          ║
 # ╚══════════════════════════════════════════════════════════╝
 
 # ── CONFIGURAÇÃO ──────────────────────────────────────────
@@ -48,7 +52,8 @@ estado = {
     for nome in set(CARTEIRAS.values())
 }
 
-mints_globais = {}  # mint → {carteira: timestamp}
+mints_globais        = {}   # mint → {carteira: timestamp}
+signatures_vistas    = set() # deduplicação
 app = Flask(__name__)
 
 
@@ -60,11 +65,13 @@ def log(msg):
 # ── TELEGRAM ──────────────────────────────────────────────
 def telegram(msg):
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "HTML"},
-            timeout=8,
+            timeout=10,
         )
+        if r.status_code != 200:
+            log(f"⚠️  Telegram status {r.status_code}: {r.text[:100]}")
     except Exception as e:
         log(f"⚠️  Telegram erro: {e}")
 
@@ -102,12 +109,21 @@ def categoria_final(reg):
     else:                                                   return "❓ DADOS INCOMPLETOS"
 
 
-# ── DEXSCREENER ───────────────────────────────────────────
+# ── DEXSCREENER + FALLBACK PUMP.FUN ───────────────────────
 def get_dados_token(mint):
+    """
+    Tenta DexScreener primeiro.
+    Se não tiver dados (token pré-migração), busca via Helius:
+      - Nome via getAsset
+      - MC estimado via getTokenSupply + preço SOL
+    """
     preco = mc = liq = volume = 0
     dex = nome = "?"
     txns_5min = 0
     idade_min = None
+    fonte = "dexscreener"
+
+    # 1️⃣ DexScreener
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -127,9 +143,68 @@ def get_dados_token(mint):
             criado_ts = par.get("pairCreatedAt")
             if criado_ts:
                 idade_min = round((time.time() - criado_ts / 1000) / 60, 1)
+            if mc > 0:
+                return preco, mc, liq, volume, dex, nome, txns_5min, idade_min, fonte
     except:
         pass
-    return preco, mc, liq, volume, dex, nome, txns_5min, idade_min
+
+    # 2️⃣ Fallback: token ainda na pump.fun — busca via Helius
+    fonte = "pumpfun"
+    dex   = "pumpfun"
+    try:
+        # Nome e metadata via getAsset
+        r = requests.post(
+            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+            json={"jsonrpc": "2.0", "id": 1, "method": "getAsset", "params": {"id": mint}},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            asset     = r.json().get("result", {})
+            nome      = asset.get("content", {}).get("metadata", {}).get("name", "?")
+            criado_ts = asset.get("createdAt")
+            if criado_ts:
+                idade_min = round((time.time() - criado_ts) / 60, 1)
+    except:
+        pass
+
+    try:
+        # Supply atual para estimar MC via bonding curve
+        r = requests.post(
+            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            result = r.json().get("result", {}).get("value", {})
+            supply = float(result.get("uiAmount", 0))
+
+            # Pump.fun: supply total = 1B tokens, bonding curve usa 793M
+            # MC estimado = (tokens vendidos / 1B) × virtual_sol_reserves × sol_price
+            # Fórmula simplificada baseada na curva da pump.fun
+            sol_price  = get_sol_price()
+            tokens_sold = max(0, 1_000_000_000 - supply)
+            # Virtual reserves iniciais: 30 SOL, cresce conforme tokens vendidos
+            virtual_sol = 30 + (tokens_sold / 1_000_000_000) * 800
+            preco_sol   = virtual_sol / (793_000_000 - tokens_sold) if tokens_sold < 793_000_000 else 0
+            preco       = preco_sol * sol_price if sol_price else None
+            mc          = round(preco * 1_000_000_000, 0) if preco else 0
+            liq         = round(virtual_sol * sol_price, 0) if sol_price else 0
+    except:
+        pass
+
+    return preco, mc, liq, volume, dex, nome, txns_5min, idade_min, fonte
+
+
+def get_sol_price():
+    """Busca preço atual do SOL em USD."""
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+            timeout=5,
+        )
+        return r.json().get("solana", {}).get("usd", 0)
+    except:
+        return 0
 
 
 # ── ALERTA MULTI-CARTEIRA ─────────────────────────────────
@@ -175,7 +250,7 @@ def checar_checkpoint(nome, mint, checkpoint):
         return
 
     reg   = est["registros"][est["pendentes"][mint]["idx"]]
-    preco, mc, liq, volume, _, _, txns_5min, _ = get_dados_token(mint)
+    preco, mc, liq, volume, _, _, txns_5min, _, _ = get_dados_token(mint)
     ratio = round(volume / reg["mc_t0"], 2) if reg.get("mc_t0", 0) > 0 else None
 
     if checkpoint == "t1":
@@ -193,7 +268,7 @@ def checar_checkpoint(nome, mint, checkpoint):
         if mc > (reg.get("mc_pico") or 0):
             reg["mc_pico"] = mc
         log(f"  ⏱️  [{nome}] T1 {reg['nome'][:20]} | MC: ${mc:,.0f} | Liq: ${liq:,.0f} | "
-            f"Vol/MC: {ratio if ratio else '—'}x | {reg['veredito_t1']}")
+            f"Txns: {txns_5min} | Vol/MC: {ratio if ratio else '—'}x | {reg['veredito_t1']}")
 
     elif checkpoint == "t2":
         reg.update({
@@ -210,7 +285,7 @@ def checar_checkpoint(nome, mint, checkpoint):
         if mc > (reg.get("mc_pico") or 0):
             reg["mc_pico"] = mc
         log(f"  ⏱️  [{nome}] T2 {reg['nome'][:20]} | MC: ${mc:,.0f} | Liq: ${liq:,.0f} | "
-            f"Vol/MC: {ratio if ratio else '—'}x | {reg['veredito_t2']}")
+            f"Txns: {txns_5min} | Vol/MC: {ratio if ratio else '—'}x | {reg['veredito_t2']}")
 
     elif checkpoint == "t3":
         reg.update({
@@ -258,40 +333,59 @@ def processar_tx(tx, carteira_addr, nome):
             est["tokens_conhecidos"].add(mint)
             data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
 
-            preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min = get_dados_token(mint)
+            preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min, fonte = get_dados_token(mint)
             ratio_vol_mc_t0 = round(volume_t0 / mc_t0, 2) if mc_t0 > 0 else None
+            token_antigo    = "sim" if (idade_min and idade_min > 1440) else "não"
 
             idx = len(est["registros"])
             est["registros"].append({
-                "data_compra": data, "carteira": nome,
-                "token_mint": mint, "nome": nome_token,
-                "dex": dex, "quantidade": round(amount, 4),
-                "signature": tx.get("signature", ""),
-                "p_t0": preco_t0, "mc_t0": mc_t0, "liq_t0": liq_t0,
-                "volume_t0": volume_t0, "txns5m_t0": txns_5min,
-                "idade_min": idade_min, "ratio_vol_mc_t0": ratio_vol_mc_t0,
+                # ── Identificação
+                "data_compra":     data,
+                "carteira":        nome,
+                "token_mint":      mint,
+                "nome":            nome_token,
+                "dex":             dex,
+                "fonte_dados":     fonte,
+                "quantidade":      round(amount, 4),
+                "signature":       tx.get("signature", ""),
+                # ── T0
+                "p_t0":            preco_t0,
+                "mc_t0":           mc_t0,
+                "liq_t0":          liq_t0,
+                "volume_t0":       volume_t0,
+                "txns5m_t0":       txns_5min,
+                "idade_min":       idade_min,
+                "token_antigo":    token_antigo,
+                "ratio_vol_mc_t0": ratio_vol_mc_t0,
+                # ── T1
                 "p_t1": None, "mc_t1": None, "liq_t1": None,
                 "volume_t1": None, "txns5m_t1": None,
                 "var_liq_t1": None, "ratio_vol_mc_t1": None,
                 "var_t1_%": None, "veredito_t1": None,
+                # ── T2
                 "p_t2": None, "mc_t2": None, "liq_t2": None,
                 "volume_t2": None, "txns5m_t2": None,
                 "var_liq_t2": None, "ratio_vol_mc_t2": None,
                 "var_t2_%": None, "veredito_t2": None,
+                # ── T3
                 "p_t3": None, "mc_t3": None, "liq_t3": None,
                 "volume_t3": None, "txns5m_t3": None,
                 "var_liq_t3": None, "ratio_vol_mc_t3": None,
                 "var_t3_%": None, "veredito_t3": None,
-                "mc_pico": mc_t0, "var_pico_%": None,
+                # ── Conclusão
+                "mc_pico":         mc_t0,
+                "var_pico_%":      None,
                 "categoria_final": "⏳ aguardando",
             })
 
             est["pendentes"][mint] = {"idx": idx}
 
+            # Flag visual para token antigo
+            flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f} dias)" if token_antigo == "sim" else ""
             log(f"🆕 [{nome}] {nome_token} | DEX: {dex} | "
                 f"MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | "
-                f"Vol/MC: {ratio_vol_mc_t0 if ratio_vol_mc_t0 else '—'}x | "
-                f"Idade: {f'{idade_min:.0f}' if idade_min else '—'}min")
+                f"Txns: {txns_5min} | Vol/MC: {ratio_vol_mc_t0 if ratio_vol_mc_t0 else '—'}x | "
+                f"Idade: {f'{idade_min:.0f}' if idade_min else '—'}min{flag_antigo}")
 
             checar_multi_carteira(mint, nome_token, nome, mc_t0, liq_t0, ratio_vol_mc_t0 or 0, idade_min or 0)
             agendar_checkpoints(nome, mint)
@@ -307,9 +401,6 @@ def salvar(nome):
 
 
 # ── WEBHOOK ENDPOINTS ─────────────────────────────────────
-# Assinaturas já processadas — evita duplicatas do Helius
-signatures_processadas = set()
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -318,10 +409,10 @@ def webhook():
             return jsonify({"ok": True})
         for tx in txs:
             sig = tx.get("signature", "")
-            if sig and sig in signatures_processadas:
+            if sig in signatures_vistas:
                 continue
             if sig:
-                signatures_processadas.add(sig)
+                signatures_vistas.add(sig)
             for acc in tx.get("accountData", []):
                 addr = acc.get("account", "")
                 if addr in CARTEIRAS:
@@ -363,23 +454,29 @@ def registrar_webhook():
         log(f"⚠️  Erro ao registrar webhook: {e}")
 
 
-# ── MAIN ──────────────────────────────────────────────────
-if __name__ == "__main__":
-    import os
-    log("🚀 MONITOR v5 INICIADO — Webhook mode")
-    for addr, nome in CARTEIRAS.items():
-        log(f"   {nome}: {addr[:20]}...")
-
+def startup():
+    """Roda em thread separada após Flask subir — garante Telegram."""
+    time.sleep(3)  # aguarda Flask estar pronto
     registrar_webhook()
-
     telegram(
-        "🚀 <b>Monitor v5 iniciado!</b>\n\n"
+        "🚀 <b>Monitor v5.1 iniciado!</b>\n\n"
         "Modo: <b>Webhook</b> — consumo mínimo\n\n"
         "Monitorando 3 carteiras:\n"
         "• carteira_A\n• carteira_B\n• carteira_C\n\n"
         "Alerta ativo:\n"
         "• 🚨 Multi-carteira (2+ carteiras no mesmo token)"
     )
+    log("✅ Startup completo — aguardando transações")
+
+
+# ── MAIN ──────────────────────────────────────────────────
+if __name__ == "__main__":
+    log("🚀 MONITOR v5.1 INICIADO — Webhook mode")
+    for addr, nome in CARTEIRAS.items():
+        log(f"   {nome}: {addr[:20]}...")
+
+    # Startup em thread — Flask sobe primeiro, depois registra webhook e avisa Telegram
+    threading.Thread(target=startup, daemon=True).start()
 
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
