@@ -266,7 +266,7 @@ def checar_pendentes(nome):
             log(f"  ⏱️  [{nome}] T1 {reg['nome'][:18]} | "
                 f"MC: ${mc:,.0f} | Liq: ${liq:,.0f} | "
                 f"Vol/MC: {reg['ratio_vol_mc_t1'] if reg['ratio_vol_mc_t1'] is not None else '—'}x | "
-                f"Wallets: {wallets} | {reg['veredito_t1']}")
+                f"{reg['veredito_t1']}")
 
         # ── T2 — 15 minutos ───────────────────────────────
         if not info["t2_ok"] and agora >= ts + 15 * 60:
@@ -315,7 +315,7 @@ def checar_pendentes(nome):
 
             info["t3_ok"] = True
             log(f"  ✅ [{nome}] FINAL {reg['nome'][:18]} | "
-                f"MC: ${mc:,.0f} | Holders: {holders_t3} | {reg['categoria_final']}")
+                f"MC: ${mc:,.0f} | {reg['categoria_final']}")
 
             del est["pendentes"][mint]
 
@@ -394,7 +394,7 @@ def processar_carteira(nome, carteira_addr):
         log(f"🆕 [{nome}] {nome_token} | DEX: {dex} | "
             f"MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | "
             f"Vol/MC: {ratio_vol_mc_t0 if ratio_vol_mc_t0 is not None else '—'}x | "
-            f"Holders: {holders_t0} | Idade: {f'{idade_min:.0f}' if idade_min else '—'}min")
+            f"Idade: {f'{idade_min:.0f}' if idade_min else '—'}min")
 
         # Alerta Telegram apenas em multi-carteira
         checar_multi_carteira(mint, nome_token, nome, mc_t0, liq_t0, ratio_vol_mc_t0 or 0, idade_min or 0)
