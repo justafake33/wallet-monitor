@@ -130,27 +130,9 @@ def get_holders(mint):
     return 0  # desativado temporariamente
 
 
-# ── HELIUS — WALLETS ÚNICAS ───────────────────────────────
+# ── HELIUS — WALLETS ÚNICAS (desativado — alto consumo de créditos) ──
 def get_wallets_unicas(mint):
-    """Conta carteiras únicas que interagiram com o token nas últimas 100 txs."""
-    try:
-        r = requests.get(
-            f"https://api.helius.xyz/v0/addresses/{mint}/transactions",
-            params={"api-key": HELIUS_API_KEY, "limit": 100},
-            timeout=6,  # timeout curto para não travar o loop
-        )
-        if r.status_code == 200:
-            wallets = set()
-            for tx in r.json():
-                for acc in tx.get("accountData", []):
-                    for change in acc.get("tokenBalanceChanges", []):
-                        w = change.get("userAccount")
-                        if w:
-                            wallets.add(w)
-            return len(wallets)
-    except:
-        pass
-    return 0
+    return 0  # desativado temporariamente
 
 
 # ── DEXSCREENER — DADOS DO TOKEN ──────────────────────────
@@ -283,7 +265,7 @@ def checar_pendentes(nome):
             info["t1_ok"] = True
             log(f"  ⏱️  [{nome}] T1 {reg['nome'][:18]} | "
                 f"MC: ${mc:,.0f} | Liq: ${liq:,.0f} | "
-                f"Vol/MC: {reg['ratio_vol_mc_t1']}x | "
+                f"Vol/MC: {reg['ratio_vol_mc_t1'] if reg['ratio_vol_mc_t1'] is not None else '—'}x | "
                 f"Wallets: {wallets} | {reg['veredito_t1']}")
 
         # ── T2 — 15 minutos ───────────────────────────────
@@ -307,7 +289,7 @@ def checar_pendentes(nome):
             info["t2_ok"] = True
             log(f"  ⏱️  [{nome}] T2 {reg['nome'][:18]} | "
                 f"MC: ${mc:,.0f} | Liq: ${liq:,.0f} | "
-                f"Vol/MC: {reg['ratio_vol_mc_t2']}x | {reg['veredito_t2']}")
+                f"Vol/MC: {reg['ratio_vol_mc_t2'] if reg['ratio_vol_mc_t2'] is not None else '—'}x | {reg['veredito_t2']}")
 
         # ── T3 — 45 minutos ───────────────────────────────
         if not info["t3_ok"] and agora >= ts + 45 * 60:
@@ -411,8 +393,8 @@ def processar_carteira(nome, carteira_addr):
 
         log(f"🆕 [{nome}] {nome_token} | DEX: {dex} | "
             f"MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | "
-            f"Vol/MC: {ratio_vol_mc_t0}x | "
-            f"Holders: {holders_t0} | Idade: {idade_min}min")
+            f"Vol/MC: {ratio_vol_mc_t0 if ratio_vol_mc_t0 is not None else '—'}x | "
+            f"Holders: {holders_t0} | Idade: {f'{idade_min:.0f}' if idade_min else '—'}min")
 
         # Alerta Telegram apenas em multi-carteira
         checar_multi_carteira(mint, nome_token, nome, mc_t0, liq_t0, ratio_vol_mc_t0 or 0, idade_min or 0)
