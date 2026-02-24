@@ -1,9 +1,13 @@
 import requests
 import pandas as pd
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
-HELIUS_API_KEY = "6ccebda4-8501-4224-a238-03d909a0d893"
+# ── CONFIGURAÇÃO ──────────────────────────────────────────
+HELIUS_API_KEY = "4f586430-90ef-4c8f-9800-b98bfe5f1151"
+
+TELEGRAM_TOKEN  = "8319320909:AAFnhGkFS1YxhthhE4RolutJScEjBCjIvrA"
+TELEGRAM_CHAT   = "6959328592"
 
 CARTEIRAS = {
     "carteira_A": "GijFWw4oNyh9ko3FaZforNsi3jk6wDovARpkKahPD4o5",
@@ -22,6 +26,7 @@ TOKENS_IGNORAR = {
     "11111111111111111111111111111111",
 }
 
+# Estado global
 estado = {
     nome: {
         "tokens_conhecidos": set(),
@@ -33,8 +38,24 @@ estado = {
     for nome in CARTEIRAS
 }
 
+# Rastreia todos os mints comprados por todas as carteiras
+# mint → {carteira: timestamp}
+mints_globais = {}
+
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+# ── TELEGRAM ──────────────────────────────────────────────
+def telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id":    TELEGRAM_CHAT,
+            "text":       msg,
+            "parse_mode": "HTML"
+        }, timeout=8)
+    except Exception as e:
+        log(f"⚠️  Telegram erro: {e}")
 
 # ── VEREDITO PARCIAL ──────────────────────────────────────
 def veredito_parcial(mc_anterior, mc_atual, tempo):
@@ -53,14 +74,11 @@ def categoria_final(reg):
     mc1 = reg.get("mc_t1") or 0
     mc2 = reg.get("mc_t2") or 0
     mc3 = reg.get("mc_t3") or 0
-
     if mc0 == 0:
         return "❓ SEM DADOS SUFICIENTES"
-
     pico      = max(mc1, mc2, mc3)
     var_pico  = (pico - mc0) / mc0 * 100 if mc0 > 0 else 0
     var_final = (mc3 - mc0) / mc0 * 100 if mc0 > 0 and mc3 > 0 else None
-
     if var_pico > 200 and var_final and var_final > 100:
         return "🏆 VENCEDOR — Subiu forte e manteve"
     elif var_pico > 200 and var_final and var_final < 0:
@@ -85,31 +103,60 @@ def get_ultimas_txs(carteira):
         r = requests.get(url, params={"limit": 10}, timeout=15)
         return r.json() if r.status_code == 200 else []
     except Exception as e:
-        log(f"⚠️  Erro ao buscar txs: {e}")
+        log(f"⚠️  Erro txs: {e}")
         return []
 
 def get_holders(mint):
-    """Busca número real de holders via Helius"""
+    """Holders reais via Helius RPC — getProgramAccounts filtrado pelo mint"""
     try:
-        url = f"https://api.helius.xyz/v1/token-holders?api-key={HELIUS_API_KEY}"
-        r = requests.post(url, json={"mint": mint, "limit": 1}, timeout=8)
+        url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method":  "getProgramAccounts",
+            "params": [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                {
+                    "filters": [
+                        {"dataSize": 165},
+                        {"memcmp": {"offset": 0, "bytes": mint}}
+                    ],
+                    "encoding": "base64"
+                }
+            ]
+        }
+        r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
-            data = r.json()
-            return data.get("total", 0)
+            result = r.json().get("result", [])
+            return len(result)
+    except:
+        pass
+    return 0
+
+def get_wallets_unicas(mint):
+    """Conta carteiras únicas que interagiram com o token via Helius"""
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions?api-key={HELIUS_API_KEY}"
+        r = requests.get(url, params={"limit": 100}, timeout=10)
+        if r.status_code == 200:
+            txs = r.json()
+            wallets = set()
+            for tx in txs:
+                for acc in tx.get("accountData", []):
+                    for change in acc.get("tokenBalanceChanges", []):
+                        w = change.get("userAccount")
+                        if w:
+                            wallets.add(w)
+            return len(wallets)
     except:
         pass
     return 0
 
 def get_dados_token(mint):
-    """
-    Retorna: preco, mc, liq, volume, dex, nome,
-             txns_5min, idade_min, criado_ts
-    """
+    """Retorna: preco, mc, liq, volume, dex, nome, txns_5min, idade_min, criado_ts"""
     preco, mc, liq, volume = None, 0, 0, 0
     dex, nome              = "?", "?"
     txns_5min, idade_min   = 0, None
     criado_ts              = None
-
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -124,19 +171,13 @@ def get_dados_token(mint):
             volume = par.get("volume", {}).get("h24") or 0
             dex    = par.get("dexId", "?")
             nome   = par.get("baseToken", {}).get("name", "?")
-
-            # Transações nos últimos 5 minutos
-            txns_m5   = par.get("txns", {}).get("m5", {})
-            txns_5min = txns_m5.get("buys", 0) + txns_m5.get("sells", 0)
-
-            # Idade do token
-            criado_ts = par.get("pairCreatedAt")
+            txns_m5    = par.get("txns", {}).get("m5", {})
+            txns_5min  = txns_m5.get("buys", 0) + txns_m5.get("sells", 0)
+            criado_ts  = par.get("pairCreatedAt")
             if criado_ts:
                 idade_min = round((time.time() - criado_ts / 1000) / 60, 1)
-
     except:
         pass
-
     return preco, mc, liq, volume, dex, nome, txns_5min, idade_min, criado_ts
 
 def extrair_novas_compras(txs, carteira_addr, tokens_conhecidos):
@@ -146,10 +187,8 @@ def extrair_novas_compras(txs, carteira_addr, tokens_conhecidos):
         src  = tx.get("source", "")
         sig  = tx.get("signature", "")
         ts   = tx.get("timestamp", 0)
-
         if tipo == "TRANSFER" and src == "SYSTEM_PROGRAM":
             continue
-
         for conta in tx.get("accountData", []):
             for change in conta.get("tokenBalanceChanges", []):
                 if change.get("userAccount") != carteira_addr:
@@ -172,6 +211,44 @@ def extrair_novas_compras(txs, carteira_addr, tokens_conhecidos):
                     tokens_conhecidos.add(mint)
     return novas
 
+# ── ALERTA MULTI-CARTEIRA ─────────────────────────────────
+def checar_multi_carteira(mint, nome, carteira_atual, mc_t0, liq_t0, ratio_vol_mc, idade_min):
+    agora = time.time()
+
+    if mint not in mints_globais:
+        mints_globais[mint] = {}
+
+    mints_globais[mint][carteira_atual] = agora
+
+    outras = {c: ts for c, ts in mints_globais[mint].items() if c != carteira_atual}
+    if not outras:
+        return
+
+    # Há outras carteiras que compraram esse token
+    linhas = []
+    for outra_cart, outra_ts in outras.items():
+        diff = round((agora - outra_ts) / 60, 1)
+        if diff < 60:  # só alerta se foi nos últimos 60 minutos
+            linhas.append(f"  • {outra_cart} comprou há {diff} min")
+
+    if not linhas:
+        return
+
+    msg = (
+        f"🚨 <b>MULTI-CARTEIRA DETECTADA</b>\n\n"
+        f"Token: <b>{nome}</b>\n"
+        f"Mint: <code>{mint}</code>\n\n"
+        f"<b>{carteira_atual}</b> comprou agora\n"
+        + "\n".join(linhas) + "\n\n"
+        f"MC T0: <b>${mc_t0:,.0f}</b>\n"
+        f"Liquidez: <b>${liq_t0:,.0f}</b>\n"
+        f"Ratio Vol/MC: <b>{ratio_vol_mc:.1f}x</b>\n"
+        f"Idade: <b>{idade_min:.0f} min</b>\n\n"
+        f"🔗 https://pump.fun/{mint}"
+    )
+    telegram(msg)
+    log(f"🚨 MULTI-CARTEIRA: {nome} — {carteira_atual} + {list(outras.keys())}")
+
 # ── CHECAR PENDENTES ──────────────────────────────────────
 def checar_pendentes(nome):
     est   = estado[nome]
@@ -182,53 +259,64 @@ def checar_pendentes(nome):
         idx = info["idx"]
         reg = est["registros"][idx]
 
-        # ── T1 — 5 minutos ──
+        # T1 — 5 minutos
         if not info["t1_ok"] and agora >= ts + 5 * 60:
             preco, mc, liq, volume, _, _, txns_5min, _, _ = get_dados_token(mint)
+
+            # Wallets únicas
+            wallets = get_wallets_unicas(mint)
+
             reg["p_t1"]       = preco
             reg["mc_t1"]      = mc
             reg["liq_t1"]     = liq
             reg["volume_t1"]  = volume
             reg["txns5m_t1"]  = txns_5min
+            reg["wallets_t1"] = wallets
+            reg["var_liq_t1"] = round((liq - reg["liq_t0"]) / reg["liq_t0"] * 100, 2) if reg.get("liq_t0", 0) > 0 else None
+            reg["ratio_vol_mc_t1"] = round(volume / reg["mc_t0"], 2) if reg.get("mc_t0", 0) > 0 else None
+
             if preco and reg["p_t0"]:
                 reg["var_t1_%"] = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2)
             reg["veredito_t1"] = veredito_parcial(reg["mc_t0"], mc, "5min")
 
-            # Atualiza MC pico
             if mc > (reg.get("mc_pico") or 0):
                 reg["mc_pico"] = mc
 
             info["t1_ok"] = True
             log(f"  ⏱️  [{nome}] T1 {reg['nome'][:18]} | "
-                f"MC: ${mc:,.0f} | Vol: ${volume:,.0f} | "
-                f"Txns5m: {txns_5min} | {reg['veredito_t1']}")
+                f"MC: ${mc:,.0f} | Liq: ${liq:,.0f} | "
+                f"Vol/MC: {reg['ratio_vol_mc_t1']}x | "
+                f"Wallets: {wallets} | {reg['veredito_t1']}")
 
-        # ── T2 — 15 minutos ──
+        # T2 — 15 minutos
         if not info["t2_ok"] and agora >= ts + 15 * 60:
             preco, mc, liq, volume, _, _, txns_5min, _, _ = get_dados_token(mint)
+
             reg["p_t2"]       = preco
             reg["mc_t2"]      = mc
             reg["liq_t2"]     = liq
             reg["volume_t2"]  = volume
             reg["txns5m_t2"]  = txns_5min
+            reg["var_liq_t2"] = round((liq - reg["liq_t1"]) / reg["liq_t1"] * 100, 2) if reg.get("liq_t1", 0) > 0 else None
+            reg["ratio_vol_mc_t2"] = round(volume / reg["mc_t0"], 2) if reg.get("mc_t0", 0) > 0 else None
+
             if preco and reg["p_t0"]:
                 reg["var_t2_%"] = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2)
             reg["veredito_t2"] = veredito_parcial(reg["mc_t1"], mc, "15min")
 
-            # Atualiza MC pico
             if mc > (reg.get("mc_pico") or 0):
                 reg["mc_pico"] = mc
 
             info["t2_ok"] = True
             log(f"  ⏱️  [{nome}] T2 {reg['nome'][:18]} | "
-                f"MC: ${mc:,.0f} | Vol: ${volume:,.0f} | "
-                f"Txns5m: {txns_5min} | {reg['veredito_t2']}")
+                f"MC: ${mc:,.0f} | Liq: ${liq:,.0f} | "
+                f"Vol/MC: {reg['ratio_vol_mc_t2']}x | {reg['veredito_t2']}")
 
-        # ── T3 — 45 minutos ──
+        # T3 — 45 minutos
         if not info["t3_ok"] and agora >= ts + 45 * 60:
             preco, mc, liq, volume, _, _, txns_5min, _, _ = get_dados_token(mint)
 
-            # Holders em T3 via Helius
+            # Holders em T3
             holders_t3 = get_holders(mint)
 
             reg["p_t3"]        = preco
@@ -237,21 +325,22 @@ def checar_pendentes(nome):
             reg["volume_t3"]   = volume
             reg["txns5m_t3"]   = txns_5min
             reg["holders_t3"]  = holders_t3
+            reg["var_liq_t3"]  = round((liq - reg["liq_t2"]) / reg["liq_t2"] * 100, 2) if reg.get("liq_t2", 0) > 0 else None
+            reg["ratio_vol_mc_t3"] = round(volume / reg["mc_t0"], 2) if reg.get("mc_t0", 0) > 0 else None
+
             if preco and reg["p_t0"]:
                 reg["var_t3_%"] = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2)
 
-            # Atualiza MC pico final
             if mc > (reg.get("mc_pico") or 0):
                 reg["mc_pico"] = mc
-            reg["var_pico_%"] = round((reg["mc_pico"] - reg["mc_t0"]) / reg["mc_t0"] * 100, 2) if reg["mc_t0"] else None
+            reg["var_pico_%"] = round((reg["mc_pico"] - reg["mc_t0"]) / reg["mc_t0"] * 100, 2) if reg.get("mc_t0") else None
 
             reg["veredito_t3"]     = veredito_parcial(reg["mc_t2"], mc, "45min")
             reg["categoria_final"] = categoria_final(reg)
             info["t3_ok"] = True
 
             log(f"  ✅ [{nome}] FINAL {reg['nome'][:18]} | "
-                f"MC: ${mc:,.0f} | Pico: ${reg['mc_pico']:,.0f} | "
-                f"Holders: {holders_t3} | {reg['categoria_final']}")
+                f"MC: ${mc:,.0f} | Holders: {holders_t3} | {reg['categoria_final']}")
 
             del est["pendentes"][mint]
 
@@ -276,43 +365,49 @@ def processar_carteira(nome, carteira_addr):
 
         preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min, _ = get_dados_token(mint)
 
-        # Holders em T0 via Helius
+        # Holders em T0
         holders_t0 = get_holders(mint)
+
+        # Ratio Vol/MC em T0
+        ratio_vol_mc_t0 = round(volume_t0 / mc_t0, 2) if mc_t0 > 0 else None
 
         idx = len(est["registros"])
         est["registros"].append({
-            # ── Identificação ──
-            "data_compra":    data,
-            "carteira":       nome,
-            "token_mint":     mint,
-            "nome":           nome_token,
-            "dex":            dex,
-            "quantidade":     compra["quantidade"],
-            "signature":      compra["signature"],
-            # ── T0 ──
-            "p_t0":           preco_t0,
-            "mc_t0":          mc_t0,
-            "liq_t0":         liq_t0,
-            "volume_t0":      volume_t0,
-            "txns5m_t0":      txns_5min,
-            "holders_t0":     holders_t0,
-            "idade_token_min": idade_min,
-            # ── T1 ──
-            "p_t1":           None, "mc_t1":    None,
-            "liq_t1":         None, "volume_t1": None, "txns5m_t1": None,
-            "var_t1_%":       None, "veredito_t1": None,
-            # ── T2 ──
-            "p_t2":           None, "mc_t2":    None,
-            "liq_t2":         None, "volume_t2": None, "txns5m_t2": None,
-            "var_t2_%":       None, "veredito_t2": None,
-            # ── T3 ──
-            "p_t3":           None, "mc_t3":    None,
-            "liq_t3":         None, "volume_t3": None, "txns5m_t3": None,
-            "holders_t3":     None,
-            "var_t3_%":       None, "veredito_t3": None,
-            # ── Conclusão ──
-            "mc_pico":        mc_t0,
-            "var_pico_%":     None,
+            # Identificação
+            "data_compra":      data,
+            "carteira":         nome,
+            "token_mint":       mint,
+            "nome":             nome_token,
+            "dex":              dex,
+            "quantidade":       compra["quantidade"],
+            "signature":        compra["signature"],
+            # T0
+            "p_t0":             preco_t0,
+            "mc_t0":            mc_t0,
+            "liq_t0":           liq_t0,
+            "volume_t0":        volume_t0,
+            "txns5m_t0":        txns_5min,
+            "holders_t0":       holders_t0,
+            "idade_min":        idade_min,
+            "ratio_vol_mc_t0":  ratio_vol_mc_t0,
+            # T1
+            "p_t1": None, "mc_t1": None, "liq_t1": None,
+            "volume_t1": None, "txns5m_t1": None, "wallets_t1": None,
+            "var_liq_t1": None, "ratio_vol_mc_t1": None,
+            "var_t1_%": None, "veredito_t1": None,
+            # T2
+            "p_t2": None, "mc_t2": None, "liq_t2": None,
+            "volume_t2": None, "txns5m_t2": None,
+            "var_liq_t2": None, "ratio_vol_mc_t2": None,
+            "var_t2_%": None, "veredito_t2": None,
+            # T3
+            "p_t3": None, "mc_t3": None, "liq_t3": None,
+            "volume_t3": None, "txns5m_t3": None, "holders_t3": None,
+            "var_liq_t3": None, "ratio_vol_mc_t3": None,
+            "var_t3_%": None, "veredito_t3": None,
+            # Conclusão
+            "mc_pico":         mc_t0,
+            "var_pico_%":      None,
             "categoria_final": "⏳ aguardando",
         })
 
@@ -325,9 +420,12 @@ def processar_carteira(nome, carteira_addr):
         }
 
         log(f"🆕 [{nome}] {nome_token} | DEX: {dex} | "
-            f"T0: ${preco_t0} | MC: ${mc_t0:,.0f} | "
-            f"Idade: {idade_min}min | Holders: {holders_t0} | "
-            f"Txns5m: {txns_5min}")
+            f"MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | "
+            f"Vol/MC: {ratio_vol_mc_t0}x | "
+            f"Holders: {holders_t0} | Idade: {idade_min}min")
+
+        # Checa multi-carteira
+        checar_multi_carteira(mint, nome_token, nome, mc_t0, liq_t0, ratio_vol_mc_t0 or 0, idade_min or 0)
 
     checar_pendentes(nome)
 
@@ -336,12 +434,20 @@ def processar_carteira(nome, carteira_addr):
         est["ultimo_save"] = time.time()
 
 # ── LOOP PRINCIPAL ────────────────────────────────────────
-log("🚀 MONITOR v3 INICIADO — 3 carteiras")
+log("🚀 MONITOR v4 INICIADO — 3 carteiras + Telegram")
 for nome, addr in CARTEIRAS.items():
     log(f"   {nome}: {addr[:20]}...")
 
-ciclo = 0
+telegram(
+    "🚀 <b>Monitor v4 iniciado!</b>\n\n"
+    "Monitorando 3 carteiras:\n"
+    "• carteira_A\n• carteira_B\n• carteira_C\n\n"
+    "Alertas ativos:\n"
+    "• 🚨 Multi-carteira\n"
+    "• 📊 Novos tokens detectados"
+)
 
+ciclo = 0
 while True:
     ciclo += 1
     try:
