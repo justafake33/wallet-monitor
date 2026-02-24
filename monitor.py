@@ -125,34 +125,9 @@ def get_ultimas_txs(carteira):
         return []
 
 
-# ── HELIUS RPC — HOLDERS ──────────────────────────────────
+# ── HELIUS RPC — HOLDERS (desativado — alto consumo de créditos) ──
 def get_holders(mint):
-    """Conta holders reais via getProgramAccounts filtrado pelo mint."""
-    try:
-        r = requests.post(
-            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-            json={
-                "jsonrpc": "2.0",
-                "id":      1,
-                "method":  "getProgramAccounts",
-                "params": [
-                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                    {
-                        "filters": [
-                            {"dataSize": 165},
-                            {"memcmp": {"offset": 0, "bytes": mint}},
-                        ],
-                        "encoding": "base64",
-                    },
-                ],
-            },
-            timeout=10,
-        )
-        if r.status_code == 200:
-            return len(r.json().get("result", []))
-    except:
-        pass
-    return 0
+    return 0  # desativado temporariamente
 
 
 # ── HELIUS — WALLETS ÚNICAS ───────────────────────────────
@@ -162,7 +137,7 @@ def get_wallets_unicas(mint):
         r = requests.get(
             f"https://api.helius.xyz/v0/addresses/{mint}/transactions",
             params={"api-key": HELIUS_API_KEY, "limit": 100},
-            timeout=10,
+            timeout=6,  # timeout curto para não travar o loop
         )
         if r.status_code == 200:
             wallets = set()
