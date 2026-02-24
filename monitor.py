@@ -18,7 +18,7 @@ from datetime import datetime
 HELIUS_API_KEY = "4f586430-90ef-4c8f-9800-b98bfe5f1151"
 
 TELEGRAM_TOKEN = "8319320909:AAFnhGkFS1YxhthhE4RolutJScEjBCjIvrA"
-TELEGRAM_CHAT  = "6959328592"
+TELEGRAM_CHAT  = "-5284184650"
 
 CARTEIRAS = {
     "carteira_A": "GijFWw4oNyh9ko3FaZforNsi3jk6wDovARpkKahPD4o5",
