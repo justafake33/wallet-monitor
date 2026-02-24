@@ -357,6 +357,7 @@ def registrar_webhook():
 
 # ── MAIN ──────────────────────────────────────────────────
 if __name__ == "__main__":
+    import os
     log("🚀 MONITOR v5 INICIADO — Webhook mode")
     for addr, nome in CARTEIRAS.items():
         log(f"   {nome}: {addr[:20]}...")
@@ -372,4 +373,5 @@ if __name__ == "__main__":
         "• 🚨 Multi-carteira (2+ carteiras no mesmo token)"
     )
 
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
