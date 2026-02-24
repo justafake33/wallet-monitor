@@ -307,6 +307,9 @@ def salvar(nome):
 
 
 # ── WEBHOOK ENDPOINTS ─────────────────────────────────────
+# Assinaturas já processadas — evita duplicatas do Helius
+signatures_processadas = set()
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -314,6 +317,11 @@ def webhook():
         if not txs:
             return jsonify({"ok": True})
         for tx in txs:
+            sig = tx.get("signature", "")
+            if sig and sig in signatures_processadas:
+                continue
+            if sig:
+                signatures_processadas.add(sig)
             for acc in tx.get("accountData", []):
                 addr = acc.get("account", "")
                 if addr in CARTEIRAS:
