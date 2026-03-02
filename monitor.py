@@ -427,28 +427,15 @@ def processar_venda(carteira_addr, nome, mint, amount_vendido, tx):
     nome_token = reg["nome"] if reg else nome_token
 
     # Calcular PnL se tiver compra registrada
-    pnl_str = ""
+    variacao = None
     if reg and reg.get("p_t0") and preco_atual:
-        variacao = (preco_atual - reg["p_t0"]) / reg["p_t0"] * 100
-        emoji_pnl = "🟢" if variacao > 0 else "🔴"
-        pnl_str = f"\n{emoji_pnl} Variação desde compra: <b>{variacao:+.1f}%</b>"
-        if variacao >= 50:
-            pnl_str += f"\n💡 <i>Pico no T1 foi {reg.get('var_t1_%', '?')}%</i>"
+        variacao = round((preco_atual - reg["p_t0"]) / reg["p_t0"] * 100, 2)
 
-    log(f"🔴 [{nome}] VENDA: {nome_token} | MC: ${mc_atual:,.0f} | amount: {amount_vendido:.2f}")
+    # Apenas log — sem notificação Telegram (venda individual polui o canal)
+    log(f"🔴 [{nome}] VENDA: {nome_token} | MC: ${mc_atual:,.0f} | "
+        f"variação: {f'{variacao:+.1f}%' if variacao is not None else '—'}")
 
-    telegram(
-        f"🔴 <b>VENDA DETECTADA</b>\n\n"
-        f"Carteira: <b>{nome}</b>\n"
-        f"Token: <b>{nome_token}</b>\n"
-        f"Mint: <code>{mint}</code>\n\n"
-        f"💰 MC atual: <b>${mc_atual:,.0f}</b>\n"
-        f"💧 Liquidez: <b>${liq_atual:,.0f}</b>"
-        f"{pnl_str}\n\n"
-        f"🔗 https://pump.fun/{mint}"
-    )
-
-    # Registrar venda no CSV
+    # Registrar venda no CSV para análise posterior
     data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
     est["registros"].append({
         "data_compra":     data,
@@ -461,6 +448,7 @@ def processar_venda(carteira_addr, nome, mint, amount_vendido, tx):
         "signature":       tx.get("signature", ""),
         "tipo":            "VENDA",
         "mc_t0":           mc_atual,
+        "var_desde_compra": variacao,
         "categoria_final": "🔴 VENDA",
     })
 
@@ -742,7 +730,7 @@ def startup():
         "🚀 <b>Monitor v6.0 iniciado!</b>\n\n"
         "Novidades:\n"
         "• 🔌 Parser agnóstico — captura Axiom, Photon, Trojan\n"
-        "• 🔴 Monitoramento de VENDAS ativo\n"
+        "• 🔴 Vendas rastreadas no CSV (sem notificação individual)\n"
         "• 🏷️ Validação de mint address\n"
         "• 👥 Dados de holders em tempo real\n"
         "• 🎯 Score de qualidade 0-10\n"
