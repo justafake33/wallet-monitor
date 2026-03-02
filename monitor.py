@@ -653,10 +653,11 @@ def processar_tx(tx, carteira_addr, nome):
         holders_count = top1_pct = top10_pct = dev_saiu = bc_progress = None
         try:
             holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0)
-        except:
-            pass
+        except Exception as e:
+            log(f"⚠️  holders erro [{nome_token}]: {e}")
 
         # Log bonding curve progress se disponível
+        flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f} dias)" if token_antigo == "sim" else ""
         holders_str = f"Holders: {holders_count}" if holders_count else "Holders: —"
         bc_str      = f" | BC: {bc_progress:.0f}%" if bc_progress is not None else ""
         dev_str     = " | Dev: ✅saiu" if dev_saiu else (" | Dev: ⚠️segura" if dev_saiu is False else "")
@@ -770,7 +771,8 @@ def webhook():
 
         return jsonify({"ok": True})
     except Exception as e:
-        log(f"⚠️  Webhook erro: {e}")
+        import traceback
+        log(f"⚠️  Webhook erro: {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False}), 500
 
 
