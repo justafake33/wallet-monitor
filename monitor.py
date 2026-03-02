@@ -7,15 +7,20 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║           MONITOR DE CARTEIRAS SOLANA — v6.0            ║
+# ║           MONITOR DE CARTEIRAS SOLANA — v6.1            ║
 # ║                                                          ║
 # ║  Novidades v6.0:                                         ║
 # ║  • Parser agnóstico — captura Axiom, Photon, Trojan      ║
-# ║  • Monitoramento de VENDA com alerta Telegram            ║
+# ║  • Monitoramento de VENDA (CSV, sem notificação indiv.)  ║
 # ║  • Validação de mint address no multi-carteira           ║
-# ║  • Dados de holders: top%, dev saiu, concentração        ║
 # ║  • Score de qualidade no alerta (0-10)                   ║
 # ║  • Alerta de saída quando T1 ≥ 50%                       ║
+# ║                                                          ║
+# ║  Novidades v6.1:                                         ║
+# ║  • Holders na bonding curve via pump.fun API             ║
+# ║  • Holders pós-migração via Helius (automático)          ║
+# ║  • Bonding curve progress % no alerta                    ║
+# ║  • Dev saiu? detectado em ambas as fases                 ║
 # ╚══════════════════════════════════════════════════════════╝
 
 # ── CONFIGURAÇÃO ──────────────────────────────────────────
@@ -245,23 +250,68 @@ def get_sol_price():
 
 
 # ══════════════════════════════════════════════════════════
-# DADOS DE HOLDERS — NOVO v6.0
+# DADOS DE HOLDERS — v6.1
+# Bonding curve  → pump.fun API (dados reais imediatos)
+# Pós-migração   → Helius getTokenLargestAccounts
 # ══════════════════════════════════════════════════════════
-def get_holder_data(mint, dev_wallet=None):
+def get_holder_data(mint, liq_t0=0, dev_wallet=None):
     """
     Retorna:
-      - holders_count: total de holders
-      - top1_pct: % do maior holder
-      - top10_pct: % dos 10 maiores holders
-      - dev_saiu: True/False/None
+      - holders_count : total de holders
+      - top1_pct      : % do maior holder
+      - top10_pct     : % dos 10 maiores holders
+      - dev_saiu      : True / False / None
+      - bc_progress   : % da bonding curve preenchida (só bonding curve)
     """
     holders_count = None
     top1_pct      = None
     top10_pct     = None
     dev_saiu      = None
+    bc_progress   = None
 
+    # ── Bonding curve: usa pump.fun API (liq = $0)
+    if liq_t0 == 0:
+        try:
+            r = requests.get(
+                f"https://frontend-api.pump.fun/coins/{mint}",
+                timeout=8,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                data          = r.json()
+                holders_count = data.get("holder_count")
+                bc_progress   = data.get("bonding_curve_progress")  # 0-100%
+                dev_wallet_bc = data.get("creator")
+
+                # Dev saiu? — verifica via reply
+                if dev_wallet_bc:
+                    try:
+                        r2 = requests.get(
+                            f"https://frontend-api.pump.fun/coins/{mint}/holders",
+                            timeout=8,
+                            headers={"User-Agent": "Mozilla/5.0"},
+                        )
+                        if r2.status_code == 200:
+                            holders_list = r2.json()
+                            top_wallets  = [h.get("owner", "") for h in holders_list[:20]]
+                            dev_saiu     = dev_wallet_bc not in top_wallets
+
+                            # Top holder %
+                            total_supply = 1_000_000_000  # pump.fun sempre 1B
+                            if holders_list:
+                                top1_bal  = holders_list[0].get("balance", 0) if holders_list else 0
+                                top10_bal = sum(h.get("balance", 0) for h in holders_list[:10])
+                                top1_pct  = round(top1_bal  / total_supply * 100, 1)
+                                top10_pct = round(top10_bal / total_supply * 100, 1)
+                    except:
+                        pass
+        except Exception as e:
+            log(f"⚠️  pump.fun holder_data erro: {e}")
+
+        return holders_count, top1_pct, top10_pct, dev_saiu, bc_progress
+
+    # ── Pós-migração: usa Helius getTokenLargestAccounts
     try:
-        # Total supply para calcular %
         r = requests.post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
             json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]},
@@ -271,36 +321,27 @@ def get_holder_data(mint, dev_wallet=None):
         if r.status_code == 200:
             total_supply = float(r.json().get("result", {}).get("value", {}).get("uiAmount", 0))
 
-        if total_supply == 0:
-            return holders_count, top1_pct, top10_pct, dev_saiu
-
-        # Top 20 holders
-        r2 = requests.post(
-            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-            json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTokenLargestAccounts",
-                "params": [mint]
-            },
-            timeout=8,
-        )
-        if r2.status_code == 200:
-            accounts = r2.json().get("result", {}).get("value", [])
-            if accounts:
-                holders_count = len(accounts)  # proxy — pode ser menos que o real
-                top1_amount   = float(accounts[0].get("uiAmount", 0)) if accounts else 0
-                top10_amount  = sum(float(a.get("uiAmount", 0)) for a in accounts[:10])
-                top1_pct      = round(top1_amount  / total_supply * 100, 1) if total_supply > 0 else None
-                top10_pct     = round(top10_amount / total_supply * 100, 1) if total_supply > 0 else None
-
-                # Dev saiu? — verifica se dev_wallet está entre os holders
-                if dev_wallet:
-                    holder_addresses = [a.get("address", "") for a in accounts]
-                    dev_saiu = dev_wallet not in holder_addresses
+        if total_supply > 0:
+            r2 = requests.post(
+                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]},
+                timeout=8,
+            )
+            if r2.status_code == 200:
+                accounts = r2.json().get("result", {}).get("value", [])
+                if accounts:
+                    holders_count = len(accounts)
+                    top1_amount   = float(accounts[0].get("uiAmount", 0))
+                    top10_amount  = sum(float(a.get("uiAmount", 0)) for a in accounts[:10])
+                    top1_pct      = round(top1_amount  / total_supply * 100, 1)
+                    top10_pct     = round(top10_amount / total_supply * 100, 1)
+                    if dev_wallet:
+                        holder_addresses = [a.get("address", "") for a in accounts]
+                        dev_saiu = dev_wallet not in holder_addresses
     except Exception as e:
-        log(f"⚠️  get_holder_data erro: {e}")
+        log(f"⚠️  helius holder_data erro: {e}")
 
-    return holders_count, top1_pct, top10_pct, dev_saiu
+    return holders_count, top1_pct, top10_pct, dev_saiu, bc_progress
 
 
 # ══════════════════════════════════════════════════════════
@@ -363,7 +404,9 @@ def extrair_mudancas_token(tx, carteira_addr):
 # ALERTA MULTI-CARTEIRA
 # ══════════════════════════════════════════════════════════
 def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
-                           ratio_vol_mc, idade_min, score, score_emoji, score_desc):
+                           ratio_vol_mc, idade_min, score, score_emoji, score_desc,
+                           holders_count=None, top1_pct=None, top10_pct=None,
+                           dev_saiu=None, bc_progress=None):
     agora = time.time()
     if mint not in mints_globais:
         mints_globais[mint] = {}
@@ -378,7 +421,7 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
 
     # Timing
     timing_s = min(int(agora - ts) for ts in recentes.values())
-    if timing_s < 60:
+    if timing_s < 120:
         timing_str = f"⚡ {timing_s}s"
         urgencia   = "🚨🚨 SINCRONIZADO"
     elif timing_s < 600:
@@ -393,6 +436,21 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
         for c, ts in recentes.items()
     ]
 
+    # Linha de holders
+    holder_linha = ""
+    if holders_count:
+        holder_linha += f"\n👥 Holders: <b>{holders_count}</b>"
+    if top1_pct is not None:
+        holder_linha += f" | Top holder: <b>{top1_pct}%</b>"
+    if top10_pct is not None:
+        holder_linha += f" | Top 10: <b>{top10_pct}%</b>"
+    if dev_saiu is True:
+        holder_linha += "\n✅ Dev saiu"
+    elif dev_saiu is False:
+        holder_linha += "\n⚠️ Dev ainda segura"
+    if bc_progress is not None:
+        holder_linha += f"\n📈 Bonding curve: <b>{bc_progress:.0f}%</b>"
+
     telegram(
         f"{urgencia}\n\n"
         f"Token: <b>{nome_token}</b>\n"
@@ -403,7 +461,8 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
         f"💰 MC: <b>${mc_t0:,.0f}</b>\n"
         f"💧 Liquidez: <b>${liq_t0:,.0f}</b>\n"
         f"📊 Vol/MC: <b>{ratio_vol_mc:.1f}x</b>\n"
-        f"🕐 Idade: <b>{idade_min:.0f} min</b>\n\n"
+        f"🕐 Idade: <b>{idade_min:.0f} min</b>"
+        f"{holder_linha}\n\n"
         f"Score: {score_emoji} <b>{score}/10 — {score_desc}</b>\n\n"
         f"🔗 https://pump.fun/{mint}"
     )
@@ -590,21 +649,24 @@ def processar_tx(tx, carteira_addr, nome):
             mc_t0, liq_t0, txns_5min, ratio_vol_mc_t0, idade_min, dex
         )
 
-        # Holders data (em thread separada para não bloquear)
-        holders_count = top1_pct = top10_pct = dev_saiu = None
+        # Holders data
+        holders_count = top1_pct = top10_pct = dev_saiu = bc_progress = None
         try:
-            holders_count, top1_pct, top10_pct, dev_saiu = get_holder_data(mint)
+            holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0)
         except:
             pass
 
-        flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f} dias)" if token_antigo == "sim" else ""
+        # Log bonding curve progress se disponível
+        holders_str = f"Holders: {holders_count}" if holders_count else "Holders: —"
+        bc_str      = f" | BC: {bc_progress:.0f}%" if bc_progress is not None else ""
+        dev_str     = " | Dev: ✅saiu" if dev_saiu else (" | Dev: ⚠️segura" if dev_saiu is False else "")
 
         log(
             f"🆕 [{nome}] {nome_token} | DEX: {dex} | "
             f"MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | "
             f"Txns: {txns_5min} | Vol/MC: {ratio_vol_mc_t0 if ratio_vol_mc_t0 else '—'}x | "
             f"Idade: {f'{idade_min:.0f}' if idade_min else '—'}min | "
-            f"Score: {score}/10{flag_antigo}"
+            f"{holders_str}{bc_str}{dev_str} | Score: {score}/10{flag_antigo}"
         )
 
         idx = len(est["registros"])
@@ -634,6 +696,7 @@ def processar_tx(tx, carteira_addr, nome):
             "top1_pct":        top1_pct,
             "top10_pct":       top10_pct,
             "dev_saiu":        dev_saiu,
+            "bc_progress":     bc_progress,
             # T1
             "p_t1": None, "mc_t1": None, "liq_t1": None,
             "volume_t1": None, "txns5m_t1": None,
@@ -657,11 +720,16 @@ def processar_tx(tx, carteira_addr, nome):
 
         est["pendentes"][mint] = {"idx": idx}
 
-        # Alerta multi-carteira (com score)
+        # Alerta multi-carteira (com score + holders)
         checar_multi_carteira(
             mint, nome_token, nome,
             mc_t0, liq_t0, ratio_vol_mc_t0 or 0, idade_min or 0,
-            score, score_emoji, score_desc
+            score, score_emoji, score_desc,
+            holders_count=holders_count,
+            top1_pct=top1_pct,
+            top10_pct=top10_pct,
+            dev_saiu=dev_saiu,
+            bc_progress=bc_progress,
         )
         agendar_checkpoints(nome, mint)
 
@@ -713,7 +781,7 @@ def health():
     compras = sum(1 for n in estado for r in estado[n]["registros"] if r.get("tipo") == "COMPRA")
     vendas  = sum(1 for n in estado for r in estado[n]["registros"] if r.get("tipo") == "VENDA")
     return jsonify({
-        "status":    "running v6.0",
+        "status":    "running v6.1",
         "registros": total,
         "compras":   compras,
         "vendas":    vendas,
@@ -727,25 +795,27 @@ def health():
 def startup():
     time.sleep(3)
     telegram(
-        "🚀 <b>Monitor v6.0 iniciado!</b>\n\n"
-        "Novidades:\n"
-        "• 🔌 Parser agnóstico — captura Axiom, Photon, Trojan\n"
-        "• 🔴 Vendas rastreadas no CSV (sem notificação individual)\n"
-        "• 🏷️ Validação de mint address\n"
-        "• 👥 Dados de holders em tempo real\n"
+        "🚀 <b>Monitor v6.1 iniciado!</b>\n\n"
+        "Novidades v6.1:\n"
+        "• 👥 Holders na bonding curve via pump.fun API\n"
+        "• 📈 Bonding curve progress % no alerta\n"
+        "• ✅ Dev saiu? detectado em tempo real\n\n"
+        "Mantido de v6.0:\n"
+        "• 🔌 Parser agnóstico (Axiom, Photon, Trojan)\n"
+        "• 🔴 Vendas rastreadas no CSV\n"
         "• 🎯 Score de qualidade 0-10\n"
-        "• ⚠️ Alerta de saída quando T1 ≥ 50%\n\n"
+        "• ⚠️ Alerta de saída T1 ≥ 50%\n\n"
         "Monitorando 3 carteiras:\n"
         "• carteira_A\n• carteira_B\n• carteira_C"
     )
-    log("✅ Monitor v6.0 — aguardando transações")
+    log("✅ Monitor v6.1 — aguardando transações")
 
 
 # ══════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    log("🚀 MONITOR v6.0 INICIADO — Webhook mode")
+    log("🚀 MONITOR v6.1 INICIADO — Webhook mode")
     for addr, nome in CARTEIRAS.items():
         log(f"   {nome}: {addr[:20]}...")
 
