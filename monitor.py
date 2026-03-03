@@ -3,15 +3,19 @@ import pandas as pd
 import time
 import threading
 import os
+import json
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
 from flask import Flask, request, jsonify
 
-# v6.3 — carteira_D + momentum + endpoint /dados (chave: neide12)
+# v6.3 + PostgreSQL — dados persistentes entre restarts
 
 HELIUS_API_KEY = "4f586430-90ef-4c8f-9800-b98bfe5f1151"
 TELEGRAM_TOKEN = "8319320909:AAFnhGkFS1YxhthhE4RolutJScEjBCjIvrA"
 TELEGRAM_CHAT  = "-5284184650"
 DASHBOARD_KEY  = "neide12"
+DATABASE_URL   = os.environ.get("DATABASE_URL", "postgresql://postgres:OgNvgWkjcpuFxZPHBaASjCKnLNsXKlpI@postgres.railway.internal:5432/railway")
 
 CARTEIRAS = {
     "GijFWw4oNyh9ko3FaZforNsi3jk6wDovARpkKahPD4o5": "carteira_A",
@@ -35,13 +39,12 @@ TOKENS_IGNORAR = {
     "11111111111111111111111111111111",
 }
 
+# Estado em memória (cache — o banco é a fonte de verdade)
 estado = {
     nome: {
         "tokens_conhecidos": set(),
         "registros":         [],
         "pendentes":         {},
-        "ultimo_save":       time.time(),
-        "arquivo_csv":       f"monitoramento_{nome}.csv",
     }
     for nome in set(CARTEIRAS.values())
 }
@@ -52,10 +55,188 @@ app = Flask(__name__)
 
 @app.after_request
 def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
+
+
+# ══════════════════════════════════════════════════════════
+# BANCO DE DADOS
+# ══════════════════════════════════════════════════════════
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS registros (
+                    id              SERIAL PRIMARY KEY,
+                    data_compra     TIMESTAMP,
+                    carteira        TEXT,
+                    tipo_carteira   TEXT,
+                    token_mint      TEXT,
+                    nome            TEXT,
+                    dex             TEXT,
+                    fonte_dados     TEXT,
+                    quantidade      FLOAT,
+                    signature       TEXT,
+                    tipo            TEXT,
+                    is_multi        BOOLEAN DEFAULT FALSE,
+                    p_t0            FLOAT,
+                    mc_t0           FLOAT,
+                    liq_t0          FLOAT,
+                    volume_t0       FLOAT,
+                    txns5m_t0       INT,
+                    buys_t0         INT,
+                    sells_t0        INT,
+                    net_momentum_t0 INT,
+                    idade_min       FLOAT,
+                    token_antigo    TEXT,
+                    ratio_vol_mc_t0 FLOAT,
+                    score_qualidade INT,
+                    holders_count   INT,
+                    top1_pct        FLOAT,
+                    top10_pct       FLOAT,
+                    dev_saiu        BOOLEAN,
+                    bc_progress     FLOAT,
+                    p_t1 FLOAT, mc_t1 FLOAT, liq_t1 FLOAT, volume_t1 FLOAT,
+                    txns5m_t1 INT, buys_t1 INT, sells_t1 INT,
+                    ratio_vol_mc_t1 FLOAT, var_t1 FLOAT, veredito_t1 TEXT,
+                    p_t2 FLOAT, mc_t2 FLOAT, liq_t2 FLOAT, volume_t2 FLOAT,
+                    txns5m_t2 INT, buys_t2 INT, sells_t2 INT,
+                    ratio_vol_mc_t2 FLOAT, var_t2 FLOAT, veredito_t2 TEXT,
+                    p_t3 FLOAT, mc_t3 FLOAT, liq_t3 FLOAT, volume_t3 FLOAT,
+                    txns5m_t3 INT, buys_t3 INT, sells_t3 INT,
+                    ratio_vol_mc_t3 FLOAT, var_t3 FLOAT, veredito_t3 TEXT,
+                    mc_pico         FLOAT,
+                    var_pico        FLOAT,
+                    categoria_final TEXT,
+                    var_desde_compra FLOAT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_token_mint ON registros(token_mint)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_carteira ON registros(carteira)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_data ON registros(data_compra)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signatures (
+                    sig TEXT PRIMARY KEY
+                )
+            """)
+        conn.commit()
+    log("✅ Banco de dados inicializado")
+
+
+def db_insert(reg):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO registros (
+                    data_compra, carteira, tipo_carteira, token_mint, nome, dex,
+                    fonte_dados, quantidade, signature, tipo, is_multi,
+                    p_t0, mc_t0, liq_t0, volume_t0, txns5m_t0, buys_t0, sells_t0,
+                    net_momentum_t0, idade_min, token_antigo, ratio_vol_mc_t0,
+                    score_qualidade, holders_count, top1_pct, top10_pct,
+                    dev_saiu, bc_progress, mc_pico, categoria_final,
+                    var_desde_compra
+                ) VALUES (
+                    %(data_compra)s, %(carteira)s, %(tipo_carteira)s, %(token_mint)s,
+                    %(nome)s, %(dex)s, %(fonte_dados)s, %(quantidade)s, %(signature)s,
+                    %(tipo)s, %(is_multi)s, %(p_t0)s, %(mc_t0)s, %(liq_t0)s,
+                    %(volume_t0)s, %(txns5m_t0)s, %(buys_t0)s, %(sells_t0)s,
+                    %(net_momentum_t0)s, %(idade_min)s, %(token_antigo)s,
+                    %(ratio_vol_mc_t0)s, %(score_qualidade)s, %(holders_count)s,
+                    %(top1_pct)s, %(top10_pct)s, %(dev_saiu)s, %(bc_progress)s,
+                    %(mc_pico)s, %(categoria_final)s, %(var_desde_compra)s
+                ) RETURNING id
+            """, reg)
+            row_id = cur.fetchone()[0]
+        conn.commit()
+    return row_id
+
+
+def db_update_checkpoint(row_id, checkpoint, preco, mc, liq, volume, txns, buys, sells, ratio, var, veredito, mc_pico):
+    n = checkpoint  # t1, t2, t3
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE registros SET
+                    p_{n}=%s, mc_{n}=%s, liq_{n}=%s, volume_{n}=%s,
+                    txns5m_{n}=%s, buys_{n}=%s, sells_{n}=%s,
+                    ratio_vol_mc_{n}=%s, var_{n}=%s, veredito_{n}=%s,
+                    mc_pico=%s
+                WHERE id=%s
+            """, (preco, mc, liq, volume, txns, buys, sells, ratio, var, veredito, mc_pico, row_id))
+        conn.commit()
+
+
+def db_update_final(row_id, mc_pico, var_pico, categoria):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE registros SET mc_pico=%s, var_pico=%s, categoria_final=%s
+                WHERE id=%s
+            """, (mc_pico, var_pico, categoria, row_id))
+        conn.commit()
+
+
+def db_update_multi(row_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE registros SET is_multi=TRUE WHERE id=%s", (row_id,))
+        conn.commit()
+
+
+def db_carregar_estado():
+    """Carrega dados do banco para memória ao iniciar."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT sig FROM signatures")
+                for row in cur.fetchall():
+                    signatures_vistas.add(row["sig"])
+
+                cur.execute("SELECT * FROM registros ORDER BY data_compra")
+                rows = cur.fetchall()
+
+        log(f"📂 Carregando {len(rows)} registros do banco...")
+        for row in rows:
+            reg = dict(row)
+            # Normaliza nomes de colunas para compatibilidade com código existente
+            reg["var_t1_%"] = reg.pop("var_t1", None)
+            reg["var_t2_%"] = reg.pop("var_t2", None)
+            reg["var_t3_%"] = reg.pop("var_t3", None)
+            reg["var_pico_%"] = reg.pop("var_pico", None)
+            if reg.get("data_compra"):
+                reg["data_compra"] = reg["data_compra"].strftime("%Y-%m-%d %H:%M:%S")
+
+            nome = reg.get("carteira")
+            if nome and nome in estado:
+                idx = len(estado[nome]["registros"])
+                estado[nome]["registros"].append(reg)
+                estado[nome]["tokens_conhecidos"].add(reg["token_mint"])
+                # Tokens ainda pendentes (sem categoria final ou aguardando)
+                if reg.get("categoria_final") == "⏳ aguardando" and reg.get("tipo") == "COMPRA":
+                    estado[nome]["pendentes"][reg["token_mint"]] = {
+                        "idx": idx,
+                        "db_id": reg["id"],
+                    }
+
+        log(f"✅ Estado restaurado — {sum(len(estado[n]['registros']) for n in estado)} registros em memória")
+    except Exception as e:
+        log(f"⚠️  Erro ao carregar estado do banco: {e}")
+
+
+def db_sig_add(sig):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO signatures(sig) VALUES(%s) ON CONFLICT DO NOTHING", (sig,))
+            conn.commit()
+    except:
+        pass
 
 
 def log(msg):
@@ -417,12 +598,23 @@ def processar_venda(carteira_addr, nome, mint, amount_vendido, tx):
             variacao = round((preco_atual - reg["p_t0"]) / reg["p_t0"] * 100, 2)
     log(f"🔴 [{nome}] VENDA: {nome_token} | MC: ${mc_atual:,.0f} | variação: {f'{variacao:+.1f}%' if variacao is not None else '—'}")
     data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
-    est["registros"].append({
-        "data_compra": data, "carteira": nome, "token_mint": mint,
-        "nome": nome_token, "tipo": "VENDA", "mc_t0": mc_atual,
-        "var_desde_compra": variacao, "categoria_final": "🔴 VENDA",
-        "signature": tx.get("signature", ""),
-    })
+    reg_venda = {
+        "data_compra": data, "carteira": nome, "tipo_carteira": TIPO_CARTEIRA.get(nome, "?"),
+        "token_mint": mint, "nome": nome_token, "dex": "venda", "fonte_dados": "venda",
+        "quantidade": round(abs(amount_vendido), 4), "signature": tx.get("signature", ""),
+        "tipo": "VENDA", "is_multi": False,
+        "p_t0": None, "mc_t0": mc_atual, "liq_t0": None, "volume_t0": None,
+        "txns5m_t0": None, "buys_t0": None, "sells_t0": None, "net_momentum_t0": None,
+        "idade_min": None, "token_antigo": None, "ratio_vol_mc_t0": None,
+        "score_qualidade": None, "holders_count": None, "top1_pct": None,
+        "top10_pct": None, "dev_saiu": None, "bc_progress": None,
+        "mc_pico": None, "categoria_final": "🔴 VENDA", "var_desde_compra": variacao,
+    }
+    est["registros"].append(reg_venda)
+    try:
+        db_insert(reg_venda)
+    except Exception as e:
+        log(f"⚠️  DB insert venda erro: {e}")
 
 
 def agendar_checkpoints(nome, mint):
@@ -435,20 +627,25 @@ def checar_checkpoint(nome, mint, checkpoint):
     est = estado[nome]
     if mint not in est["pendentes"]:
         return
-    reg   = est["registros"][est["pendentes"][mint]["idx"]]
+    info  = est["pendentes"][mint]
+    reg   = est["registros"][info["idx"]]
+    db_id = info.get("db_id")
     preco, mc, liq, volume, _, _, txns_5min, _, _, buys, sells = get_dados_token(mint)
     ratio = round(volume / reg["mc_t0"], 2) if reg.get("mc_t0", 0) > 0 else None
 
     if checkpoint == "t1":
         var_t1 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
+        veredito = veredito_parcial(reg["mc_t0"], mc, "5min")
+        mc_pico = max(mc, reg.get("mc_pico") or 0)
         reg.update({
             "p_t1": preco, "mc_t1": mc, "liq_t1": liq, "volume_t1": volume,
             "txns5m_t1": txns_5min, "buys_t1": buys, "sells_t1": sells,
             "ratio_vol_mc_t1": ratio, "var_t1_%": var_t1,
-            "veredito_t1": veredito_parcial(reg["mc_t0"], mc, "5min"),
+            "veredito_t1": veredito, "mc_pico": mc_pico,
         })
-        if mc > (reg.get("mc_pico") or 0): reg["mc_pico"] = mc
-        log(f"  ⏱️  [{nome}] T1 {reg['nome'][:20]} | MC: ${mc:,.0f} | {reg['veredito_t1']}")
+        if db_id:
+            db_update_checkpoint(db_id, "t1", preco, mc, liq, volume, txns_5min, buys, sells, ratio, var_t1, veredito, mc_pico)
+        log(f"  ⏱️  [{nome}] T1 {reg['nome'][:20]} | MC: ${mc:,.0f} | {veredito}")
         if reg.get("is_multi") and var_t1:
             if var_t1 >= 100:
                 telegram(f"🚨 <b>SAÍDA — T1 EXPLOSIVO</b>\n\nToken: <b>{reg['nome']}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n⚠️ <i>Considere realizar lucro.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
@@ -456,30 +653,37 @@ def checar_checkpoint(nome, mint, checkpoint):
                 telegram(f"⚠️ <b>SAÍDA — T1 FORTE</b>\n\nToken: <b>{reg['nome']}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n💡 <i>Considere realizar parte.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
 
     elif checkpoint == "t2":
+        var_t2 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
+        veredito = veredito_parcial(reg.get("mc_t1"), mc, "15min")
+        mc_pico = max(mc, reg.get("mc_pico") or 0)
         reg.update({
             "p_t2": preco, "mc_t2": mc, "liq_t2": liq, "volume_t2": volume,
             "txns5m_t2": txns_5min, "buys_t2": buys, "sells_t2": sells,
-            "ratio_vol_mc_t2": ratio,
-            "var_t2_%": round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None,
-            "veredito_t2": veredito_parcial(reg.get("mc_t1"), mc, "15min"),
+            "ratio_vol_mc_t2": ratio, "var_t2_%": var_t2,
+            "veredito_t2": veredito, "mc_pico": mc_pico,
         })
-        if mc > (reg.get("mc_pico") or 0): reg["mc_pico"] = mc
-        log(f"  ⏱️  [{nome}] T2 {reg['nome'][:20]} | MC: ${mc:,.0f} | {reg['veredito_t2']}")
+        if db_id:
+            db_update_checkpoint(db_id, "t2", preco, mc, liq, volume, txns_5min, buys, sells, ratio, var_t2, veredito, mc_pico)
+        log(f"  ⏱️  [{nome}] T2 {reg['nome'][:20]} | MC: ${mc:,.0f} | {veredito}")
 
     elif checkpoint == "t3":
+        var_t3 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
+        veredito = veredito_parcial(reg.get("mc_t2"), mc, "45min")
+        mc_pico = max(mc, reg.get("mc_pico") or 0)
+        var_pico = round((mc_pico - reg["mc_t0"]) / reg["mc_t0"] * 100, 2) if reg.get("mc_t0") else None
+        cat = categoria_final({**reg, "mc_t3": mc})
         reg.update({
             "p_t3": preco, "mc_t3": mc, "liq_t3": liq, "volume_t3": volume,
             "txns5m_t3": txns_5min, "buys_t3": buys, "sells_t3": sells,
-            "ratio_vol_mc_t3": ratio,
-            "var_t3_%": round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None,
-            "veredito_t3": veredito_parcial(reg.get("mc_t2"), mc, "45min"),
+            "ratio_vol_mc_t3": ratio, "var_t3_%": var_t3,
+            "veredito_t3": veredito, "mc_pico": mc_pico,
+            "var_pico_%": var_pico, "categoria_final": cat,
         })
-        if mc > (reg.get("mc_pico") or 0): reg["mc_pico"] = mc
-        reg["var_pico_%"]      = round((reg["mc_pico"] - reg["mc_t0"]) / reg["mc_t0"] * 100, 2) if reg.get("mc_t0") else None
-        reg["categoria_final"] = categoria_final(reg)
-        log(f"  ✅ [{nome}] FINAL {reg['nome'][:20]} | MC: ${mc:,.0f} | {reg['categoria_final']}")
+        if db_id:
+            db_update_checkpoint(db_id, "t3", preco, mc, liq, volume, txns_5min, buys, sells, ratio, var_t3, veredito, mc_pico)
+            db_update_final(db_id, mc_pico, var_pico, cat)
+        log(f"  ✅ [{nome}] FINAL {reg['nome'][:20]} | MC: ${mc:,.0f} | {cat}")
         del est["pendentes"][mint]
-        salvar(nome)
 
 
 def processar_tx(tx, carteira_addr, nome):
@@ -511,10 +715,9 @@ def processar_tx(tx, carteira_addr, nome):
             log(f"holders erro [{nome_token}]: {e}")
 
         flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
-        log(f"🆕 [{nome}] {nome_token} | {dex} | MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | Txns: {txns_5min} | Vol/MC: {ratio_vol_mc_t0 or '—'}x | Idade: {f'{idade_min:.0f}' if idade_min else '—'}min | Score: {score}/10{flag_antigo}")
+        log(f"🆕 [{nome}] {nome_token} | {dex} | MC: ${mc_t0:,.0f} | Score: {score}/10{flag_antigo}")
 
-        idx = len(est["registros"])
-        est["registros"].append({
+        reg = {
             "data_compra": data, "carteira": nome, "tipo_carteira": TIPO_CARTEIRA.get(nome, "?"),
             "token_mint": mint, "nome": nome_token, "dex": dex, "fonte_dados": fonte,
             "quantidade": round(amount, 4), "signature": tx.get("signature", ""),
@@ -535,9 +738,20 @@ def processar_tx(tx, carteira_addr, nome):
             "p_t3": None, "mc_t3": None, "liq_t3": None, "volume_t3": None,
             "txns5m_t3": None, "buys_t3": None, "sells_t3": None,
             "ratio_vol_mc_t3": None, "var_t3_%": None, "veredito_t3": None,
-            "mc_pico": mc_t0, "var_pico_%": None, "categoria_final": "⏳ aguardando",
-        })
-        est["pendentes"][mint] = {"idx": idx}
+            "mc_pico": mc_t0, "var_pico_%": None, "var_desde_compra": None,
+            "categoria_final": "⏳ aguardando",
+        }
+
+        idx = len(est["registros"])
+        est["registros"].append(reg)
+
+        db_id = None
+        try:
+            db_id = db_insert(reg)
+        except Exception as e:
+            log(f"⚠️  DB insert erro: {e}")
+
+        est["pendentes"][mint] = {"idx": idx, "db_id": db_id}
 
         is_multi = checar_multi_carteira(
             mint, nome_token, nome, mc_t0, liq_t0,
@@ -548,15 +762,13 @@ def processar_tx(tx, carteira_addr, nome):
             buys_5min=buys_5min, sells_5min=sells_5min,
         )
         est["registros"][idx]["is_multi"] = bool(is_multi)
+        if is_multi and db_id:
+            try:
+                db_update_multi(db_id)
+            except:
+                pass
+
         agendar_checkpoints(nome, mint)
-
-
-def salvar(nome):
-    est = estado[nome]
-    if not est["registros"]:
-        return
-    pd.DataFrame(est["registros"]).to_csv(est["arquivo_csv"], index=False)
-    log(f"💾 [{nome}] Salvo — {len(est['registros'])} registros")
 
 
 def enviar_csv_diario():
@@ -581,6 +793,9 @@ def enviar_csv_diario():
     threading.Timer(24 * 60 * 60, enviar_csv_diario).start()
 
 
+# ══════════════════════════════════════════════════════════
+# ROTAS
+# ══════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -593,6 +808,7 @@ def webhook():
                 continue
             if sig:
                 signatures_vistas.add(sig)
+                threading.Thread(target=db_sig_add, args=[sig], daemon=True).start()
             for acc in tx.get("accountData", []):
                 addr = acc.get("account", "")
                 if addr in CARTEIRAS:
@@ -613,7 +829,7 @@ def health():
     vendas  = sum(1 for n in estado for r in estado[n]["registros"] if r.get("tipo") == "VENDA")
     multis  = sum(1 for n in estado for r in estado[n]["registros"] if r.get("is_multi"))
     return jsonify({
-        "status": "running v6.3", "registros": total,
+        "status": "running v6.3+db", "registros": total,
         "compras": compras, "vendas": vendas,
         "multis": multis, "pendentes": pend,
     })
@@ -652,7 +868,7 @@ def dados():
 
     return jsonify({
         "status":    "ok",
-        "versao":    "v6.3",
+        "versao":    "v6.3+db",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "resumo": {
             "total_registros": len(todos),
@@ -668,23 +884,26 @@ def dados():
     })
 
 
+# ══════════════════════════════════════════════════════════
+# STARTUP
+# ══════════════════════════════════════════════════════════
 def startup():
     time.sleep(3)
+    init_db()
+    db_carregar_estado()
+    total = sum(len(estado[n]["registros"]) for n in estado)
     telegram(
-        "🚀 <b>Monitor v6.3 iniciado!</b>\n\n"
-        "• 👤 carteira_D adicionada\n"
-        "• 🔄 Momentum no alerta\n"
-        "• 📊 Dashboard /dados ativo\n\n"
+        f"🚀 <b>Monitor v6.3 + PostgreSQL iniciado!</b>\n\n"
+        f"📂 {total} registros restaurados do banco\n\n"
         "🤖 carteira_A | 🤖 carteira_B\n"
-        "👤 carteira_C | 👤 carteira_D (nova)"
+        "👤 carteira_C | 👤 carteira_D"
     )
-    log("✅ Monitor v6.3 — aguardando transações")
+    log("✅ Monitor v6.3+db — aguardando transações")
     threading.Timer(24 * 60 * 60, enviar_csv_diario).start()
-    log("📅 Envio de CSV agendado para 24h")
 
 
 if __name__ == "__main__":
-    log("🚀 MONITOR v6.3 INICIADO — Webhook mode")
+    log("🚀 MONITOR v6.3+DB INICIADO")
     for addr, nome in CARTEIRAS.items():
         log(f"   {nome}: {addr[:20]}...")
     threading.Thread(target=startup, daemon=True).start()
