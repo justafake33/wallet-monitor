@@ -328,9 +328,24 @@ def categoria_final(reg):
     mc2 = reg.get("mc_t2") or 0
     mc3 = reg.get("mc_t3") or 0
     if mc0 == 0: return "❓ SEM DADOS"
+
+    var_t1 = reg.get("var_t1_%")
+    var_t2 = reg.get("var_t2_%")
+    var_t3 = reg.get("var_t3_%")
+
+    # Detectar morte após pico: T1 alto mas T2/T3 zerados ou muito negativos
+    t2_morreu = mc2 == 0 or (var_t2 is not None and var_t2 < -70)
+    t3_morreu = mc3 == 0 or (var_t3 is not None and var_t3 < -70)
+
+    if var_t1 and var_t1 > 50 and t2_morreu:
+        return "🎯 PUMP & DUMP — Morreu após T1"
+    if var_t1 and var_t1 > 50 and mc3 > 0 and t3_morreu:
+        return "🎯 PUMP & DUMP — Morreu após pico"
+
     pico = max(mc1, mc2, mc3)
     var_pico  = (pico - mc0) / mc0 * 100 if mc0 else 0
     var_final = (mc3  - mc0) / mc0 * 100 if mc0 and mc3 else None
+
     if   var_pico > 200 and var_final and var_final >  100: return "🏆 VENCEDOR — Subiu forte e manteve"
     elif var_pico > 200 and var_final and var_final <    0: return "🎯 PUMP & DUMP — Subiu e colapsou"
     elif var_pico >  50 and var_final and var_final >   20: return "📈 BOM TRADE — Crescimento sólido"
@@ -441,9 +456,17 @@ def get_holder_data(mint, liq_t0=0, dev_wallet=None):
                             top_wallets  = [h.get("owner", "") for h in holders_list[:20]]
                             dev_saiu     = dev_wallet_bc not in top_wallets
                             total_supply = 1_000_000_000
-                            if holders_list:
-                                top1_pct  = round(holders_list[0].get("balance", 0) / total_supply * 100, 1)
-                                top10_pct = round(sum(h.get("balance", 0) for h in holders_list[:10]) / total_supply * 100, 1)
+                            # Endereços conhecidos de LP e bonding curve — excluir do cálculo
+                            LP_ADDRESSES = {
+                                "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",  # pump.fun bonding curve
+                                "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1", # raydium LP
+                                "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1", # raydium authority
+                            }
+                            holders_validos = [h for h in holders_list if h.get("owner","") not in LP_ADDRESSES]
+                            if holders_validos:
+                                top10_pct = round(sum(h.get("balance", 0) for h in holders_validos[:10]) / total_supply * 100, 1)
+                                # top1 excluindo LP (para referência interna, não exibido)
+                                top1_pct  = round(holders_validos[0].get("balance", 0) / total_supply * 100, 1)
                     except:
                         pass
         except Exception as e:
@@ -467,11 +490,20 @@ def get_holder_data(mint, liq_t0=0, dev_wallet=None):
             if r2.status_code == 200:
                 accounts = r2.json().get("result", {}).get("value", [])
                 if accounts:
-                    holders_count = len(accounts)
-                    top1_pct      = round(float(accounts[0].get("uiAmount", 0)) / total_supply * 100, 1)
-                    top10_pct     = round(sum(float(a.get("uiAmount", 0)) for a in accounts[:10]) / total_supply * 100, 1)
+                    # Filtrar endereços de LP conhecidos
+                    LP_KNOWN = {
+                        "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",
+                        "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+                        "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+                        "HVh6wHNBAsG3pq1Bj5oCzRjoWKVogEDHwUHkRz3ekFgt",  # raydium pool
+                    }
+                    accs_validos = [a for a in accounts if a.get("address","") not in LP_KNOWN]
+                    holders_count = len(accs_validos)
+                    if accs_validos:
+                        top10_pct = round(sum(float(a.get("uiAmount", 0)) for a in accs_validos[:10]) / total_supply * 100, 1)
+                        top1_pct  = round(float(accs_validos[0].get("uiAmount", 0)) / total_supply * 100, 1)
                     if dev_wallet:
-                        dev_saiu = dev_wallet not in [a.get("address", "") for a in accounts]
+                        dev_saiu = dev_wallet not in [a.get("address", "") for a in accs_validos]
     except Exception as e:
         log(f"helius holder erro: {e}")
     return holders_count, top1_pct, top10_pct, dev_saiu, bc_progress
