@@ -6,18 +6,12 @@ import os
 from datetime import datetime
 from flask import Flask, request, jsonify
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║           MONITOR DE CARTEIRAS SOLANA — v6.3            ║
-# ║                                                          ║
-# ║  Novidades v6.3:                                         ║
-# ║  • carteira_D adicionada (humano, 53% WR)                ║
-# ║  • Momentum no alerta (compradores vs vendedores m5)     ║
-# ║  • Barra visual de momentum                              ║
-# ╚══════════════════════════════════════════════════════════╝
+# v6.3 — carteira_D + momentum + endpoint /dados (chave: neide12)
 
 HELIUS_API_KEY = "4f586430-90ef-4c8f-9800-b98bfe5f1151"
 TELEGRAM_TOKEN = "8319320909:AAFnhGkFS1YxhthhE4RolutJScEjBCjIvrA"
 TELEGRAM_CHAT  = "-5284184650"
+DASHBOARD_KEY  = "neide12"
 
 CARTEIRAS = {
     "GijFWw4oNyh9ko3FaZforNsi3jk6wDovARpkKahPD4o5": "carteira_A",
@@ -32,9 +26,6 @@ TIPO_CARTEIRA = {
     "carteira_C": "humano",
     "carteira_D": "humano",
 }
-
-WEBHOOK_URL   = "https://wallet-monitor-production-fef3.up.railway.app/webhook"
-SALVAR_A_CADA = 10
 
 TOKENS_IGNORAR = {
     "So11111111111111111111111111111111111111112",
@@ -72,78 +63,46 @@ def telegram(msg):
             timeout=10,
         )
         if r.status_code != 200:
-            log(f"⚠️  Telegram status {r.status_code}: {r.text[:100]}")
+            log(f"Telegram erro {r.status_code}: {r.text[:100]}")
     except Exception as e:
-        log(f"⚠️  Telegram erro: {e}")
+        log(f"Telegram erro: {e}")
 
 
 def telegram_documento(caminho, caption=""):
     try:
         with open(caminho, "rb") as f:
-            r = requests.post(
+            requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
                 data={"chat_id": TELEGRAM_CHAT, "caption": caption, "parse_mode": "HTML"},
                 files={"document": f},
                 timeout=30,
             )
-        if r.status_code != 200:
-            log(f"⚠️  Telegram documento status {r.status_code}: {r.text[:100]}")
-        else:
-            log(f"📤 CSV enviado: {caminho}")
     except Exception as e:
-        log(f"⚠️  Telegram documento erro: {e}")
+        log(f"Telegram doc erro: {e}")
 
 
-# ══════════════════════════════════════════════════════════
-# MOMENTUM — barra visual compradores vs vendedores
-# ══════════════════════════════════════════════════════════
 def calcular_momentum(buys, sells):
-    """
-    Retorna linha de momentum formatada para o alerta.
-    Ex: 🟢🟢🟢🟢🟢⬜⬜⬜ +12 (17B / 5S)
-    """
-    if buys is None:
-        buys = 0
-    if sells is None:
-        sells = 0
-
+    buys = buys or 0
+    sells = sells or 0
     total = buys + sells
     if total == 0:
         return None, 0
-
     net = buys - sells
-    ratio = buys / total  # 0.0 a 1.0
-
-    # Barra de 8 blocos
-    blocos_verdes = round(ratio * 8)
-    blocos_cinza  = 8 - blocos_verdes
-    barra = "🟢" * blocos_verdes + "⬜" * blocos_cinza
-
+    blocos = round(buys / total * 8)
+    barra = "🟢" * blocos + "⬜" * (8 - blocos)
     sinal = "+" if net >= 0 else ""
-    linha = f"{barra} {sinal}{net} ({buys}B / {sells}S)"
-
-    return linha, net
+    return f"{barra} {sinal}{net} ({buys}B / {sells}S)", net
 
 
 def classificar_momentum(net, total):
-    """Classifica o momentum em texto."""
-    if total == 0:
-        return ""
-    if net >= 10:
-        return "🔥 Comprando forte"
-    elif net >= 5:
-        return "📈 Pressão compradora"
-    elif net >= 0:
-        return "➡️  Equilibrado"
-    elif net >= -5:
-        return "📉 Pressão vendedora"
-    else:
-        return "🧊 Vendendo forte"
+    if not total: return ""
+    if net >= 10:  return "🔥 Comprando forte"
+    if net >= 5:   return "📈 Pressão compradora"
+    if net >= 0:   return "➡️  Equilibrado"
+    if net >= -5:  return "📉 Pressão vendedora"
+    return "🧊 Vendendo forte"
 
 
-# ══════════════════════════════════════════════════════════
-# SCORE DE QUALIDADE
-# ══════════════════════════════════════════════════════════
 def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex):
     score = 0
     if ratio_vol_mc and ratio_vol_mc >= 3:     score += 3
@@ -180,11 +139,10 @@ def categoria_final(reg):
     mc1 = reg.get("mc_t1") or 0
     mc2 = reg.get("mc_t2") or 0
     mc3 = reg.get("mc_t3") or 0
-    if mc0 == 0:
-        return "❓ SEM DADOS SUFICIENTES"
-    pico      = max(mc1, mc2, mc3)
-    var_pico  = (pico - mc0) / mc0 * 100 if mc0 > 0 else 0
-    var_final = (mc3  - mc0) / mc0 * 100 if mc0 > 0 and mc3 > 0 else None
+    if mc0 == 0: return "❓ SEM DADOS"
+    pico = max(mc1, mc2, mc3)
+    var_pico  = (pico - mc0) / mc0 * 100 if mc0 else 0
+    var_final = (mc3  - mc0) / mc0 * 100 if mc0 and mc3 else None
     if   var_pico > 200 and var_final and var_final >  100: return "🏆 VENCEDOR — Subiu forte e manteve"
     elif var_pico > 200 and var_final and var_final <    0: return "🎯 PUMP & DUMP — Subiu e colapsou"
     elif var_pico >  50 and var_final and var_final >   20: return "📈 BOM TRADE — Crescimento sólido"
@@ -195,9 +153,6 @@ def categoria_final(reg):
     else:                                                   return "❓ DADOS INCOMPLETOS"
 
 
-# ══════════════════════════════════════════════════════════
-# DADOS DO TOKEN
-# ══════════════════════════════════════════════════════════
 def get_dados_token(mint):
     preco = mc = liq = volume = 0
     dex = nome = "?"
@@ -208,25 +163,24 @@ def get_dados_token(mint):
         r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=8)
         pairs = r.json().get("pairs") or []
         if pairs:
-            par       = sorted(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0) or 0, reverse=True)[0]
-            preco     = float(par["priceUsd"]) if par.get("priceUsd") else None
-            mc        = par.get("marketCap") or 0
-            liq       = par.get("liquidity", {}).get("usd") or 0
-            volume    = par.get("volume", {}).get("h24") or 0
-            dex       = par.get("dexId", "?")
-            nome      = par.get("baseToken", {}).get("name", "?")
-            m5        = par.get("txns", {}).get("m5", {})
+            par        = sorted(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0) or 0, reverse=True)[0]
+            preco      = float(par["priceUsd"]) if par.get("priceUsd") else None
+            mc         = par.get("marketCap") or 0
+            liq        = par.get("liquidity", {}).get("usd") or 0
+            volume     = par.get("volume", {}).get("h24") or 0
+            dex        = par.get("dexId", "?")
+            nome       = par.get("baseToken", {}).get("name", "?")
+            m5         = par.get("txns", {}).get("m5", {})
             buys_5min  = m5.get("buys", 0)
             sells_5min = m5.get("sells", 0)
             txns_5min  = buys_5min + sells_5min
-            criado_ts = par.get("pairCreatedAt")
+            criado_ts  = par.get("pairCreatedAt")
             if criado_ts:
                 idade_min = round((time.time() - criado_ts / 1000) / 60, 1)
             if mc > 0:
                 return preco, mc, liq, volume, dex, nome, txns_5min, idade_min, fonte, buys_5min, sells_5min
     except:
         pass
-
     fonte = "pumpfun"
     dex   = "pumpfun"
     try:
@@ -275,9 +229,6 @@ def get_sol_price():
         return 0
 
 
-# ══════════════════════════════════════════════════════════
-# HOLDERS
-# ══════════════════════════════════════════════════════════
 def get_holder_data(mint, liq_t0=0, dev_wallet=None):
     holders_count = top1_pct = top10_pct = dev_saiu = bc_progress = None
     if liq_t0 == 0:
@@ -303,14 +254,12 @@ def get_holder_data(mint, liq_t0=0, dev_wallet=None):
                             dev_saiu     = dev_wallet_bc not in top_wallets
                             total_supply = 1_000_000_000
                             if holders_list:
-                                top1_bal  = holders_list[0].get("balance", 0)
-                                top10_bal = sum(h.get("balance", 0) for h in holders_list[:10])
-                                top1_pct  = round(top1_bal  / total_supply * 100, 1)
-                                top10_pct = round(top10_bal / total_supply * 100, 1)
+                                top1_pct  = round(holders_list[0].get("balance", 0) / total_supply * 100, 1)
+                                top10_pct = round(sum(h.get("balance", 0) for h in holders_list[:10]) / total_supply * 100, 1)
                     except:
                         pass
         except Exception as e:
-            log(f"⚠️  pump.fun holder_data erro: {e}")
+            log(f"pump.fun holder erro: {e}")
         return holders_count, top1_pct, top10_pct, dev_saiu, bc_progress
     try:
         r = requests.post(
@@ -331,21 +280,15 @@ def get_holder_data(mint, liq_t0=0, dev_wallet=None):
                 accounts = r2.json().get("result", {}).get("value", [])
                 if accounts:
                     holders_count = len(accounts)
-                    top1_amount   = float(accounts[0].get("uiAmount", 0))
-                    top10_amount  = sum(float(a.get("uiAmount", 0)) for a in accounts[:10])
-                    top1_pct      = round(top1_amount  / total_supply * 100, 1)
-                    top10_pct     = round(top10_amount / total_supply * 100, 1)
+                    top1_pct      = round(float(accounts[0].get("uiAmount", 0)) / total_supply * 100, 1)
+                    top10_pct     = round(sum(float(a.get("uiAmount", 0)) for a in accounts[:10]) / total_supply * 100, 1)
                     if dev_wallet:
-                        holder_addresses = [a.get("address", "") for a in accounts]
-                        dev_saiu = dev_wallet not in holder_addresses
+                        dev_saiu = dev_wallet not in [a.get("address", "") for a in accounts]
     except Exception as e:
-        log(f"⚠️  helius holder_data erro: {e}")
+        log(f"helius holder erro: {e}")
     return holders_count, top1_pct, top10_pct, dev_saiu, bc_progress
 
 
-# ══════════════════════════════════════════════════════════
-# PARSER DE TX
-# ══════════════════════════════════════════════════════════
 def extrair_mudancas_token(tx, carteira_addr):
     mudancas = {}
     for conta in tx.get("accountData", []):
@@ -360,9 +303,8 @@ def extrair_mudancas_token(tx, carteira_addr):
                 amount = int(raw.get("tokenAmount", "0")) / (10 ** int(raw.get("decimals", 0)))
             except:
                 continue
-            if amount == 0:
-                continue
-            mudancas[mint] = mudancas.get(mint, 0) + amount
+            if amount != 0:
+                mudancas[mint] = mudancas.get(mint, 0) + amount
     for transfer in tx.get("tokenTransfers", []):
         mint     = transfer.get("mint", "")
         to_acc   = transfer.get("toUserAccount", "")
@@ -382,9 +324,6 @@ def extrair_mudancas_token(tx, carteira_addr):
     return [{"mint": m, "amount": a} for m, a in mudancas.items()]
 
 
-# ══════════════════════════════════════════════════════════
-# ALERTA MULTI-CARTEIRA
-# ══════════════════════════════════════════════════════════
 def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
                            ratio_vol_mc, idade_min, score, score_emoji, score_desc,
                            holders_count=None, top1_pct=None, top10_pct=None,
@@ -413,50 +352,37 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
         timing_str = f"{timing_s//60}min"
         urgencia   = "ℹ️ MULTI-CARTEIRA"
 
-    todas_carteiras = list(recentes.keys()) + [carteira_atual]
-    tem_humano = any(TIPO_CARTEIRA.get(c) == "humano" for c in todas_carteiras)
-    humanos    = [c for c in todas_carteiras if TIPO_CARTEIRA.get(c) == "humano"]
-    if tem_humano:
+    todas   = list(recentes.keys()) + [carteira_atual]
+    humanos = [c for c in todas if TIPO_CARTEIRA.get(c) == "humano"]
+    if humanos:
         urgencia = "⭐" * len(humanos) + " " + urgencia
 
     def label(c):
-        icone = "👤" if TIPO_CARTEIRA.get(c) == "humano" else "🤖"
-        return f"{icone} <b>{c}</b>"
+        i = "👤" if TIPO_CARTEIRA.get(c) == "humano" else "🤖"
+        return f"{i} <b>{c}</b>"
 
-    linhas = [
-        f"  • {label(c)} comprou há {round((agora-ts)/60,1)} min"
-        for c, ts in recentes.items()
-    ]
+    linhas = [f"  • {label(c)} comprou há {round((agora-ts)/60,1)} min" for c, ts in recentes.items()]
 
-    # Holders
     holder_linha = ""
-    if holders_count:
-        holder_linha += f"\n👥 Holders: <b>{holders_count}</b>"
-    if top1_pct is not None:
-        holder_linha += f" | Top: <b>{top1_pct}%</b>"
-    if top10_pct is not None:
-        holder_linha += f" | Top10: <b>{top10_pct}%</b>"
-    if dev_saiu is True:
-        holder_linha += "\n✅ Dev saiu"
-    elif dev_saiu is False:
-        holder_linha += "\n⚠️ Dev ainda segura"
-    if bc_progress is not None:
-        holder_linha += f"\n📈 BC: <b>{bc_progress:.0f}%</b>"
+    if holders_count:         holder_linha += f"\n👥 Holders: <b>{holders_count}</b>"
+    if top1_pct is not None:  holder_linha += f" | Top: <b>{top1_pct}%</b>"
+    if top10_pct is not None: holder_linha += f" | Top10: <b>{top10_pct}%</b>"
+    if dev_saiu is True:      holder_linha += "\n✅ Dev saiu"
+    elif dev_saiu is False:   holder_linha += "\n⚠️ Dev ainda segura"
+    if bc_progress is not None: holder_linha += f"\n📈 BC: <b>{bc_progress:.0f}%</b>"
 
-    # Momentum
     momentum_linha = ""
-    barra_momentum, net = calcular_momentum(buys_5min, sells_5min)
-    if barra_momentum:
-        classificacao = classificar_momentum(net, buys_5min + sells_5min)
-        momentum_linha = f"\n🔄 {barra_momentum}\n    {classificacao}"
+    barra, net = calcular_momentum(buys_5min, sells_5min)
+    if barra:
+        momentum_linha = f"\n🔄 {barra}\n    {classificar_momentum(net, buys_5min + sells_5min)}"
 
-    icone_atual = "👤" if TIPO_CARTEIRA.get(carteira_atual) == "humano" else "🤖"
+    icone = "👤" if TIPO_CARTEIRA.get(carteira_atual) == "humano" else "🤖"
 
     telegram(
         f"{urgencia}\n\n"
         f"Token: <b>{nome_token}</b>\n"
         f"Mint: <code>{mint}</code>\n\n"
-        f"{icone_atual} <b>{carteira_atual}</b> comprou agora\n"
+        f"{icone} <b>{carteira_atual}</b> comprou agora\n"
         + "\n".join(linhas) + "\n\n"
         f"⏱ Timing: <b>{timing_str}</b>\n\n"
         f"💰 MC: <b>${mc_t0:,.0f}</b>\n"
@@ -468,47 +394,30 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
         f"Score: {score_emoji} <b>{score}/10 — {score_desc}</b>\n\n"
         f"🔗 https://pump.fun/{mint}"
     )
-    log(f"🚨 MULTI: {nome_token} | {carteira_atual} + {list(recentes.keys())} | timing={timing_str} | humano={tem_humano}")
+    log(f"🚨 MULTI: {nome_token} | {carteira_atual} + {list(recentes.keys())} | {timing_str}")
     return True
 
 
-# ══════════════════════════════════════════════════════════
-# VENDA
-# ══════════════════════════════════════════════════════════
 def processar_venda(carteira_addr, nome, mint, amount_vendido, tx):
     est = estado[nome]
-    reg = None
-    for r in est["registros"]:
-        if r.get("token_mint") == mint:
-            reg = r
-            break
-    preco_atual, mc_atual, _, _, _, nome_token, _, _, _, _, _ = get_dados_token(mint)
+    reg = next((r for r in est["registros"] if r.get("token_mint") == mint), None)
+    _, mc_atual, _, _, _, nome_token, _, _, _, _, _ = get_dados_token(mint)
     nome_token = reg["nome"] if reg else nome_token
     variacao = None
-    if reg and reg.get("p_t0") and preco_atual:
-        variacao = round((preco_atual - reg["p_t0"]) / reg["p_t0"] * 100, 2)
-    log(f"🔴 [{nome}] VENDA: {nome_token} | MC: ${mc_atual:,.0f} | "
-        f"variação: {f'{variacao:+.1f}%' if variacao is not None else '—'}")
+    if reg and reg.get("p_t0"):
+        preco_atual, _, _, _, _, _, _, _, _, _, _ = get_dados_token(mint)
+        if preco_atual:
+            variacao = round((preco_atual - reg["p_t0"]) / reg["p_t0"] * 100, 2)
+    log(f"🔴 [{nome}] VENDA: {nome_token} | MC: ${mc_atual:,.0f} | variação: {f'{variacao:+.1f}%' if variacao is not None else '—'}")
     data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
     est["registros"].append({
-        "data_compra":      data,
-        "carteira":         nome,
-        "token_mint":       mint,
-        "nome":             nome_token,
-        "dex":              "venda",
-        "fonte_dados":      "venda",
-        "quantidade":       round(abs(amount_vendido), 4),
-        "signature":        tx.get("signature", ""),
-        "tipo":             "VENDA",
-        "mc_t0":            mc_atual,
-        "var_desde_compra": variacao,
-        "categoria_final":  "🔴 VENDA",
+        "data_compra": data, "carteira": nome, "token_mint": mint,
+        "nome": nome_token, "tipo": "VENDA", "mc_t0": mc_atual,
+        "var_desde_compra": variacao, "categoria_final": "🔴 VENDA",
+        "signature": tx.get("signature", ""),
     })
 
 
-# ══════════════════════════════════════════════════════════
-# CHECKPOINTS T1 / T2 / T3
-# ══════════════════════════════════════════════════════════
 def agendar_checkpoints(nome, mint):
     threading.Timer(5  * 60, checar_checkpoint, args=[nome, mint, "t1"]).start()
     threading.Timer(15 * 60, checar_checkpoint, args=[nome, mint, "t2"]).start()
@@ -526,65 +435,39 @@ def checar_checkpoint(nome, mint, checkpoint):
     if checkpoint == "t1":
         var_t1 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
         reg.update({
-            "p_t1": preco, "mc_t1": mc, "liq_t1": liq,
-            "volume_t1": volume, "txns5m_t1": txns_5min,
-            "buys_t1": buys, "sells_t1": sells,
-            "var_liq_t1": round((liq - reg["liq_t0"]) / reg["liq_t0"] * 100, 2) if reg.get("liq_t0", 0) > 0 else None,
+            "p_t1": preco, "mc_t1": mc, "liq_t1": liq, "volume_t1": volume,
+            "txns5m_t1": txns_5min, "buys_t1": buys, "sells_t1": sells,
             "ratio_vol_mc_t1": ratio, "var_t1_%": var_t1,
             "veredito_t1": veredito_parcial(reg["mc_t0"], mc, "5min"),
         })
-        if mc > (reg.get("mc_pico") or 0):
-            reg["mc_pico"] = mc
+        if mc > (reg.get("mc_pico") or 0): reg["mc_pico"] = mc
         log(f"  ⏱️  [{nome}] T1 {reg['nome'][:20]} | MC: ${mc:,.0f} | {reg['veredito_t1']}")
-
         if reg.get("is_multi") and var_t1:
             if var_t1 >= 100:
-                telegram(
-                    f"🚨 <b>SAÍDA — T1 EXPLOSIVO</b>\n\n"
-                    f"Token: <b>{reg['nome']}</b>\n"
-                    f"Carteira: <b>{reg['carteira']}</b>\n\n"
-                    f"📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n"
-                    f"💰 MC atual: <b>${mc:,.0f}</b>\n\n"
-                    f"⚠️ <i>Considere realizar lucro.</i>\n\n"
-                    f"🔗 https://pump.fun/{reg['token_mint']}"
-                )
+                telegram(f"🚨 <b>SAÍDA — T1 EXPLOSIVO</b>\n\nToken: <b>{reg['nome']}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n⚠️ <i>Considere realizar lucro.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
             elif var_t1 >= 50:
-                telegram(
-                    f"⚠️ <b>SAÍDA — T1 FORTE</b>\n\n"
-                    f"Token: <b>{reg['nome']}</b>\n"
-                    f"Carteira: <b>{reg['carteira']}</b>\n\n"
-                    f"📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n"
-                    f"💰 MC atual: <b>${mc:,.0f}</b>\n\n"
-                    f"💡 <i>Considere realizar parte da posição.</i>\n\n"
-                    f"🔗 https://pump.fun/{reg['token_mint']}"
-                )
+                telegram(f"⚠️ <b>SAÍDA — T1 FORTE</b>\n\nToken: <b>{reg['nome']}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n💡 <i>Considere realizar parte.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
 
     elif checkpoint == "t2":
         reg.update({
-            "p_t2": preco, "mc_t2": mc, "liq_t2": liq,
-            "volume_t2": volume, "txns5m_t2": txns_5min,
-            "buys_t2": buys, "sells_t2": sells,
-            "var_liq_t2": round((liq - reg.get("liq_t1", liq)) / reg.get("liq_t1", liq) * 100, 2) if reg.get("liq_t1", 0) > 0 else None,
+            "p_t2": preco, "mc_t2": mc, "liq_t2": liq, "volume_t2": volume,
+            "txns5m_t2": txns_5min, "buys_t2": buys, "sells_t2": sells,
             "ratio_vol_mc_t2": ratio,
             "var_t2_%": round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None,
             "veredito_t2": veredito_parcial(reg.get("mc_t1"), mc, "15min"),
         })
-        if mc > (reg.get("mc_pico") or 0):
-            reg["mc_pico"] = mc
+        if mc > (reg.get("mc_pico") or 0): reg["mc_pico"] = mc
         log(f"  ⏱️  [{nome}] T2 {reg['nome'][:20]} | MC: ${mc:,.0f} | {reg['veredito_t2']}")
 
     elif checkpoint == "t3":
         reg.update({
-            "p_t3": preco, "mc_t3": mc, "liq_t3": liq,
-            "volume_t3": volume, "txns5m_t3": txns_5min,
-            "buys_t3": buys, "sells_t3": sells,
-            "var_liq_t3": round((liq - reg.get("liq_t2", liq)) / reg.get("liq_t2", liq) * 100, 2) if reg.get("liq_t2", 0) > 0 else None,
+            "p_t3": preco, "mc_t3": mc, "liq_t3": liq, "volume_t3": volume,
+            "txns5m_t3": txns_5min, "buys_t3": buys, "sells_t3": sells,
             "ratio_vol_mc_t3": ratio,
             "var_t3_%": round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None,
             "veredito_t3": veredito_parcial(reg.get("mc_t2"), mc, "45min"),
         })
-        if mc > (reg.get("mc_pico") or 0):
-            reg["mc_pico"] = mc
+        if mc > (reg.get("mc_pico") or 0): reg["mc_pico"] = mc
         reg["var_pico_%"]      = round((reg["mc_pico"] - reg["mc_t0"]) / reg["mc_t0"] * 100, 2) if reg.get("mc_t0") else None
         reg["categoria_final"] = categoria_final(reg)
         log(f"  ✅ [{nome}] FINAL {reg['nome'][:20]} | MC: ${mc:,.0f} | {reg['categoria_final']}")
@@ -592,15 +475,11 @@ def checar_checkpoint(nome, mint, checkpoint):
         salvar(nome)
 
 
-# ══════════════════════════════════════════════════════════
-# PROCESSAR TX
-# ══════════════════════════════════════════════════════════
 def processar_tx(tx, carteira_addr, nome):
     est = estado[nome]
     if tx.get("type") == "TRANSFER" and tx.get("source") == "SYSTEM_PROGRAM":
         return
-    mudancas = extrair_mudancas_token(tx, carteira_addr)
-    for mudanca in mudancas:
+    for mudanca in extrair_mudancas_token(tx, carteira_addr):
         mint   = mudanca["mint"]
         amount = mudanca["amount"]
         if amount == 0:
@@ -611,8 +490,8 @@ def processar_tx(tx, carteira_addr, nome):
         if mint in est["tokens_conhecidos"]:
             continue
         est["tokens_conhecidos"].add(mint)
-        data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
 
+        data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
         preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min, fonte, buys_5min, sells_5min = get_dados_token(mint)
         ratio_vol_mc_t0 = round(volume_t0 / mc_t0, 2) if mc_t0 > 0 else None
         token_antigo    = "sim" if (idade_min and idade_min > 1440) else "não"
@@ -622,80 +501,40 @@ def processar_tx(tx, carteira_addr, nome):
         try:
             holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0)
         except Exception as e:
-            log(f"⚠️  holders erro [{nome_token}]: {e}")
+            log(f"holders erro [{nome_token}]: {e}")
 
-        # Momentum para log
-        barra_m, net_m = calcular_momentum(buys_5min, sells_5min)
-        momentum_log = f" | {barra_m}" if barra_m else ""
-
-        flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f} dias)" if token_antigo == "sim" else ""
-        log(
-            f"🆕 [{nome}] {nome_token} | {dex} | "
-            f"MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | "
-            f"Txns: {txns_5min} | Vol/MC: {ratio_vol_mc_t0 if ratio_vol_mc_t0 else '—'}x | "
-            f"Idade: {f'{idade_min:.0f}' if idade_min else '—'}min | "
-            f"Holders: {holders_count or '—'} | Score: {score}/10"
-            f"{momentum_log}{flag_antigo}"
-        )
+        flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
+        log(f"🆕 [{nome}] {nome_token} | {dex} | MC: ${mc_t0:,.0f} | Liq: ${liq_t0:,.0f} | Txns: {txns_5min} | Vol/MC: {ratio_vol_mc_t0 or '—'}x | Idade: {f'{idade_min:.0f}' if idade_min else '—'}min | Score: {score}/10{flag_antigo}")
 
         idx = len(est["registros"])
         est["registros"].append({
-            "data_compra":     data,
-            "carteira":        nome,
-            "tipo_carteira":   TIPO_CARTEIRA.get(nome, "?"),
-            "token_mint":      mint,
-            "nome":            nome_token,
-            "dex":             dex,
-            "fonte_dados":     fonte,
-            "quantidade":      round(amount, 4),
-            "signature":       tx.get("signature", ""),
-            "tipo":            "COMPRA",
-            "is_multi":        False,
-            "p_t0":            preco_t0,
-            "mc_t0":           mc_t0,
-            "liq_t0":          liq_t0,
-            "volume_t0":       volume_t0,
-            "txns5m_t0":       txns_5min,
-            "buys_t0":         buys_5min,
-            "sells_t0":        sells_5min,
+            "data_compra": data, "carteira": nome, "tipo_carteira": TIPO_CARTEIRA.get(nome, "?"),
+            "token_mint": mint, "nome": nome_token, "dex": dex, "fonte_dados": fonte,
+            "quantidade": round(amount, 4), "signature": tx.get("signature", ""),
+            "tipo": "COMPRA", "is_multi": False,
+            "p_t0": preco_t0, "mc_t0": mc_t0, "liq_t0": liq_t0, "volume_t0": volume_t0,
+            "txns5m_t0": txns_5min, "buys_t0": buys_5min, "sells_t0": sells_5min,
             "net_momentum_t0": (buys_5min or 0) - (sells_5min or 0),
-            "idade_min":       idade_min,
-            "token_antigo":    token_antigo,
-            "ratio_vol_mc_t0": ratio_vol_mc_t0,
-            "score_qualidade": score,
-            "holders_count":   holders_count,
-            "top1_pct":        top1_pct,
-            "top10_pct":       top10_pct,
-            "dev_saiu":        dev_saiu,
-            "bc_progress":     bc_progress,
-            # T1
-            "p_t1": None, "mc_t1": None, "liq_t1": None,
-            "volume_t1": None, "txns5m_t1": None,
-            "buys_t1": None, "sells_t1": None,
-            "var_liq_t1": None, "ratio_vol_mc_t1": None,
-            "var_t1_%": None, "veredito_t1": None,
-            # T2
-            "p_t2": None, "mc_t2": None, "liq_t2": None,
-            "volume_t2": None, "txns5m_t2": None,
-            "buys_t2": None, "sells_t2": None,
-            "var_liq_t2": None, "ratio_vol_mc_t2": None,
-            "var_t2_%": None, "veredito_t2": None,
-            # T3
-            "p_t3": None, "mc_t3": None, "liq_t3": None,
-            "volume_t3": None, "txns5m_t3": None,
-            "buys_t3": None, "sells_t3": None,
-            "var_liq_t3": None, "ratio_vol_mc_t3": None,
-            "var_t3_%": None, "veredito_t3": None,
-            "mc_pico":         mc_t0,
-            "var_pico_%":      None,
-            "categoria_final": "⏳ aguardando",
+            "idade_min": idade_min, "token_antigo": token_antigo,
+            "ratio_vol_mc_t0": ratio_vol_mc_t0, "score_qualidade": score,
+            "holders_count": holders_count, "top1_pct": top1_pct,
+            "top10_pct": top10_pct, "dev_saiu": dev_saiu, "bc_progress": bc_progress,
+            "p_t1": None, "mc_t1": None, "liq_t1": None, "volume_t1": None,
+            "txns5m_t1": None, "buys_t1": None, "sells_t1": None,
+            "ratio_vol_mc_t1": None, "var_t1_%": None, "veredito_t1": None,
+            "p_t2": None, "mc_t2": None, "liq_t2": None, "volume_t2": None,
+            "txns5m_t2": None, "buys_t2": None, "sells_t2": None,
+            "ratio_vol_mc_t2": None, "var_t2_%": None, "veredito_t2": None,
+            "p_t3": None, "mc_t3": None, "liq_t3": None, "volume_t3": None,
+            "txns5m_t3": None, "buys_t3": None, "sells_t3": None,
+            "ratio_vol_mc_t3": None, "var_t3_%": None, "veredito_t3": None,
+            "mc_pico": mc_t0, "var_pico_%": None, "categoria_final": "⏳ aguardando",
         })
-
         est["pendentes"][mint] = {"idx": idx}
 
         is_multi = checar_multi_carteira(
-            mint, nome_token, nome,
-            mc_t0, liq_t0, ratio_vol_mc_t0 or 0, idade_min or 0,
+            mint, nome_token, nome, mc_t0, liq_t0,
+            ratio_vol_mc_t0 or 0, idade_min or 0,
             score, score_emoji, score_desc,
             holders_count=holders_count, top1_pct=top1_pct,
             top10_pct=top10_pct, dev_saiu=dev_saiu, bc_progress=bc_progress,
@@ -705,9 +544,6 @@ def processar_tx(tx, carteira_addr, nome):
         agendar_checkpoints(nome, mint)
 
 
-# ══════════════════════════════════════════════════════════
-# SALVAR CSV
-# ══════════════════════════════════════════════════════════
 def salvar(nome):
     est = estado[nome]
     if not est["registros"]:
@@ -716,40 +552,28 @@ def salvar(nome):
     log(f"💾 [{nome}] Salvo — {len(est['registros'])} registros")
 
 
-# ══════════════════════════════════════════════════════════
-# ENVIO DIÁRIO DE CSV
-# ══════════════════════════════════════════════════════════
 def enviar_csv_diario():
-    log("📤 Enviando relatório consolidado para o Telegram...")
-    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
+    log("📤 Enviando CSV diário...")
     todos = []
     for nome in set(CARTEIRAS.values()):
         todos.extend(estado[nome]["registros"])
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
     if not todos:
-        telegram("📊 <b>Relatório diário</b>\n\nNenhum registro até o momento.")
+        telegram("📊 <b>Relatório diário</b>\n\nNenhum registro ainda.")
         threading.Timer(24 * 60 * 60, enviar_csv_diario).start()
         return
     caminho = "monitoramento_consolidado.csv"
     pd.DataFrame(todos).to_csv(caminho, index=False)
-    total   = len(todos)
     compras = sum(1 for r in todos if r.get("tipo") == "COMPRA")
     vendas  = sum(1 for r in todos if r.get("tipo") == "VENDA")
     multis  = sum(1 for r in todos if r.get("is_multi"))
-    caption = (
-        f"📊 <b>Relatório consolidado</b>\n"
-        f"Gerado em: {agora}\n\n"
-        f"Total: <b>{total}</b> registros\n"
-        f"Compras: <b>{compras}</b> | Vendas: <b>{vendas}</b>\n"
-        f"Multi-carteira: <b>{multis}</b>\n\n"
-        f"<i>Próximo envio em 24h</i>"
-    )
-    telegram_documento(caminho, caption=caption)
+    telegram_documento(caminho, caption=(
+        f"📊 <b>Relatório consolidado</b>\nGerado em: {agora}\n\n"
+        f"Compras: <b>{compras}</b> | Vendas: <b>{vendas}</b>\nMulti: <b>{multis}</b>"
+    ))
     threading.Timer(24 * 60 * 60, enviar_csv_diario).start()
 
 
-# ══════════════════════════════════════════════════════════
-# WEBHOOK
-# ══════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -770,7 +594,7 @@ def webhook():
         return jsonify({"ok": True})
     except Exception as e:
         import traceback
-        log(f"⚠️  Webhook erro: {e}\n{traceback.format_exc()}")
+        log(f"Webhook erro: {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False}), 500
 
 
@@ -788,22 +612,64 @@ def health():
     })
 
 
-# ══════════════════════════════════════════════════════════
-# STARTUP
-# ══════════════════════════════════════════════════════════
+@app.route("/dados", methods=["GET"])
+def dados():
+    if request.args.get("key") != DASHBOARD_KEY:
+        return jsonify({"erro": "nao autorizado"}), 401
+
+    todos = []
+    for n in estado:
+        todos.extend(estado[n]["registros"])
+    todos_sorted = sorted(todos, key=lambda r: r.get("data_compra", ""), reverse=True)
+
+    ativos = []
+    for n in estado:
+        for mint, info in estado[n]["pendentes"].items():
+            ativos.append(dict(estado[n]["registros"][info["idx"]]))
+
+    multis = [r for r in todos_sorted if r.get("is_multi") and r.get("tipo") == "COMPRA"][:50]
+
+    stats = {}
+    for n in set(CARTEIRAS.values()):
+        regs_n      = [r for r in todos if r.get("carteira") == n and r.get("tipo") == "COMPRA"]
+        finalizados = [r for r in regs_n if r.get("categoria_final") and "aguardando" not in r.get("categoria_final", "")]
+        vencedores  = [r for r in finalizados if r.get("var_pico_%") and r["var_pico_%"] > 20]
+        winrate     = round(len(vencedores) / len(finalizados) * 100, 1) if finalizados else 0
+        stats[n] = {
+            "tipo": TIPO_CARTEIRA.get(n, "?"),
+            "total": len(regs_n),
+            "finalizados": len(finalizados),
+            "vencedores": len(vencedores),
+            "winrate": winrate,
+        }
+
+    return jsonify({
+        "status":    "ok",
+        "versao":    "v6.3",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "resumo": {
+            "total_registros": len(todos),
+            "compras": sum(1 for r in todos if r.get("tipo") == "COMPRA"),
+            "vendas":  sum(1 for r in todos if r.get("tipo") == "VENDA"),
+            "multis":  len(multis),
+            "ativos":  len(ativos),
+        },
+        "stats_carteiras": stats,
+        "tokens_ativos":   ativos,
+        "alertas_multi":   multis,
+        "historico":       todos_sorted[:200],
+    })
+
+
 def startup():
     time.sleep(3)
     telegram(
         "🚀 <b>Monitor v6.3 iniciado!</b>\n\n"
-        "Novidades:\n"
-        "• 👤 carteira_D adicionada (53% WR, +10k/7d)\n"
-        "• 🔄 Momentum no alerta (compradores vs vendedores)\n"
-        "• ⭐⭐ Dois humanos sincronizados = destaque duplo\n\n"
-        "Carteiras:\n"
-        "• 🤖 carteira_A (bot)\n"
-        "• 🤖 carteira_B (bot)\n"
-        "• 👤 carteira_C (humano)\n"
-        "• 👤 carteira_D (humano — nova)"
+        "• 👤 carteira_D adicionada\n"
+        "• 🔄 Momentum no alerta\n"
+        "• 📊 Dashboard /dados ativo\n\n"
+        "🤖 carteira_A | 🤖 carteira_B\n"
+        "👤 carteira_C | 👤 carteira_D (nova)"
     )
     log("✅ Monitor v6.3 — aguardando transações")
     threading.Timer(24 * 60 * 60, enviar_csv_diario).start()
