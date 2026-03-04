@@ -219,10 +219,40 @@ def db_carregar_estado():
                 estado[nome]["tokens_conhecidos"].add(reg["token_mint"])
                 # Tokens ainda pendentes (sem categoria final ou aguardando)
                 if reg.get("categoria_final") == "⏳ aguardando" and reg.get("tipo") == "COMPRA":
-                    estado[nome]["pendentes"][reg["token_mint"]] = {
-                        "idx": idx,
-                        "db_id": reg["id"],
-                    }
+                    mint = reg["token_mint"]
+                    db_id = reg["id"]
+                    # Calcular quanto tempo passou desde a compra
+                    try:
+                        dt_compra = datetime.strptime(reg["data_compra"], "%Y-%m-%d %H:%M:%S")
+                        segundos_passados = (datetime.now() - dt_compra).total_seconds()
+                    except:
+                        segundos_passados = 9999
+
+                    # Se passou mais de 2 horas, finalizar como sem dados
+                    if segundos_passados > 7200:
+                        log(f"⚠️  Token preso há {segundos_passados/3600:.1f}h — finalizando: {reg.get('nome','?')}")
+                        cat = "❓ DADOS INCOMPLETOS — restart perdeu checkpoints"
+                        try:
+                            db_update_final(db_id, reg.get("mc_pico") or reg.get("mc_t0") or 0, None, cat)
+                            reg["categoria_final"] = cat
+                        except Exception as e:
+                            log(f"⚠️  Erro ao finalizar token preso: {e}")
+                        continue  # não adiciona aos pendentes
+
+                    # Reagendar checkpoints restantes
+                    estado[nome]["pendentes"][mint] = {"idx": idx, "db_id": db_id}
+                    # T1 (5min)
+                    if reg.get("mc_t1") is None:
+                        delay = max(0, 300 - segundos_passados)
+                        threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t1"]).start()
+                    # T2 (15min)
+                    if reg.get("mc_t2") is None:
+                        delay = max(0, 900 - segundos_passados)
+                        threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t2"]).start()
+                    # T3 (45min)
+                    if reg.get("mc_t3") is None:
+                        delay = max(0, 2700 - segundos_passados)
+                        threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t3"]).start()
 
         log(f"✅ Estado restaurado — {sum(len(estado[n]['registros']) for n in estado)} registros em memória")
     except Exception as e:
@@ -747,6 +777,39 @@ def processar_tx(tx, carteira_addr, nome):
             log(f"holders erro [{nome_token}]: {e}")
 
         flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
+        # Token sem MC — provavelmente morreu antes de ser indexado
+        if not mc_t0 or mc_t0 == 0:
+            log(f"⚠️  [{nome}] {nome_token} | MC=0 — token não indexado, ignorando checkpoints")
+            reg_sem_dados = {
+                "data_compra": data, "carteira": nome, "tipo_carteira": TIPO_CARTEIRA.get(nome, "?"),
+                "token_mint": mint, "nome": nome_token, "dex": dex, "fonte_dados": fonte,
+                "quantidade": round(amount, 4), "signature": tx.get("signature", ""),
+                "tipo": "COMPRA", "is_multi": False,
+                "p_t0": None, "mc_t0": 0, "liq_t0": liq_t0, "volume_t0": volume_t0,
+                "txns5m_t0": txns_5min, "buys_t0": buys_5min, "sells_t0": sells_5min,
+                "net_momentum_t0": 0, "idade_min": idade_min, "token_antigo": token_antigo,
+                "ratio_vol_mc_t0": None, "score_qualidade": 0,
+                "holders_count": None, "top1_pct": None, "top10_pct": None,
+                "dev_saiu": None, "bc_progress": None,
+                "p_t1": None, "mc_t1": None, "liq_t1": None, "volume_t1": None,
+                "txns5m_t1": None, "buys_t1": None, "sells_t1": None,
+                "ratio_vol_mc_t1": None, "var_t1_%": None, "veredito_t1": None,
+                "p_t2": None, "mc_t2": None, "liq_t2": None, "volume_t2": None,
+                "txns5m_t2": None, "buys_t2": None, "sells_t2": None,
+                "ratio_vol_mc_t2": None, "var_t2_%": None, "veredito_t2": None,
+                "p_t3": None, "mc_t3": None, "liq_t3": None, "volume_t3": None,
+                "txns5m_t3": None, "buys_t3": None, "sells_t3": None,
+                "ratio_vol_mc_t3": None, "var_t3_%": None, "veredito_t3": None,
+                "mc_pico": 0, "var_pico_%": None, "var_desde_compra": None,
+                "categoria_final": "❓ SEM DADOS — MC não disponível",
+            }
+            est["registros"].append(reg_sem_dados)
+            try:
+                db_insert(reg_sem_dados)
+            except Exception as e:
+                log(f"⚠️  DB insert sem dados erro: {e}")
+            continue
+
         log(f"🆕 [{nome}] {nome_token} | {dex} | MC: ${mc_t0:,.0f} | Score: {score}/10{flag_antigo}")
 
         reg = {
