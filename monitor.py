@@ -800,7 +800,21 @@ def processar_tx(tx, carteira_addr, nome):
         est["tokens_conhecidos"].add(mint)
 
         data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
+        # Buscar dados com retentativa — tokens novos podem não estar indexados imediatamente
         preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min, fonte, buys_5min, sells_5min = get_dados_token(mint)
+        if not mc_t0 or mc_t0 == 0:
+            log(f"  ⏳ MC=0 na primeira tentativa para {nome_token[:20]}, aguardando 30s...")
+            time.sleep(30)
+            preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min, fonte, buys_5min, sells_5min = get_dados_token(mint)
+        if not mc_t0 or mc_t0 == 0:
+            log(f"  ⏳ MC=0 na segunda tentativa, aguardando 60s...")
+            time.sleep(60)
+            preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min, fonte, buys_5min, sells_5min = get_dados_token(mint)
+        if not mc_t0 or mc_t0 == 0:
+            log(f"  ⏳ MC=0 na terceira tentativa, aguardando 2min...")
+            time.sleep(120)
+            preco_t0, mc_t0, liq_t0, volume_t0, dex, nome_token, txns_5min, idade_min, fonte, buys_5min, sells_5min = get_dados_token(mint)
+
         ratio_vol_mc_t0 = round(volume_t0 / mc_t0, 2) if mc_t0 > 0 else None
         token_antigo    = "sim" if (idade_min and idade_min > 1440) else "não"
         score, score_emoji, score_desc = calcular_score(mc_t0, liq_t0, txns_5min, ratio_vol_mc_t0, idade_min, dex)
@@ -812,9 +826,26 @@ def processar_tx(tx, carteira_addr, nome):
             log(f"holders erro [{nome_token}]: {e}")
 
         flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
-        # Token sem MC — provavelmente morreu antes de ser indexado
+        # Token sem MC — registra no mints_globais para alertas multi funcionarem
         if not mc_t0 or mc_t0 == 0:
             log(f"⚠️  [{nome}] {nome_token} | MC=0 — token não indexado, ignorando checkpoints")
+            agora_ts = time.time()
+            if mint not in mints_globais:
+                mints_globais[mint] = {}
+            mints_globais[mint][nome] = agora_ts
+            outras = {c: ts for c, ts in mints_globais[mint].items()
+                      if c != nome and (agora_ts - ts) / 60 <= 60}
+            if outras:
+                outras_str = ", ".join(outras.keys())
+                timing_s = min(int(agora_ts - ts) for ts in outras.values())
+                telegram(
+                    f"🚨 <b>ALERTA MULTI-CARTEIRA</b> (MC não disponível)\n\n"
+                    f"Token: <b>{nome_token}</b>\n"
+                    f"Carteiras: <b>{outras_str}</b> + <b>{nome}</b>\n"
+                    f"⏱ Timing: <b>{timing_s}s</b>\n"
+                    f"⚠️ MC não indexado ainda\n\n"
+                    f"🔗 https://pump.fun/{mint}"
+                )
             reg_sem_dados = {
                 "data_compra": data, "carteira": nome, "tipo_carteira": TIPO_CARTEIRA.get(nome, "?"),
                 "token_mint": mint, "nome": nome_token, "dex": dex, "fonte_dados": fonte,
