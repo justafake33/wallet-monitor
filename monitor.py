@@ -241,18 +241,23 @@ def db_carregar_estado():
 
                     # Reagendar checkpoints restantes
                     estado[nome]["pendentes"][mint] = {"idx": idx, "db_id": db_id}
-                    # T1 (5min)
+                    # Checkpoints principais
                     if reg.get("mc_t1") is None:
                         delay = max(0, 300 - segundos_passados)
                         threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t1"]).start()
-                    # T2 (15min)
                     if reg.get("mc_t2") is None:
                         delay = max(0, 900 - segundos_passados)
                         threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t2"]).start()
-                    # T3 (45min)
                     if reg.get("mc_t3") is None:
                         delay = max(0, 2700 - segundos_passados)
                         threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t3"]).start()
+                    # Snapshots intermediários de pico
+                    if segundos_passados < 120:
+                        threading.Timer(max(0, 120 - segundos_passados), atualizar_pico, args=[nome, mint, "2min"]).start()
+                    if segundos_passados < 600:
+                        threading.Timer(max(0, 600 - segundos_passados), atualizar_pico, args=[nome, mint, "10min"]).start()
+                    if segundos_passados < 1500:
+                        threading.Timer(max(0, 1500 - segundos_passados), atualizar_pico, args=[nome, mint, "25min"]).start()
 
         log(f"✅ Estado restaurado — {sum(len(estado[n]['registros']) for n in estado)} registros em memória")
     except Exception as e:
@@ -680,9 +685,39 @@ def processar_venda(carteira_addr, nome, mint, amount_vendido, tx):
 
 
 def agendar_checkpoints(nome, mint):
+    # Checkpoints principais — gravam dados no banco e dashboard
     threading.Timer(5  * 60, checar_checkpoint, args=[nome, mint, "t1"]).start()
     threading.Timer(15 * 60, checar_checkpoint, args=[nome, mint, "t2"]).start()
     threading.Timer(45 * 60, checar_checkpoint, args=[nome, mint, "t3"]).start()
+    # Snapshots intermediários — só atualizam mc_pico se for maior
+    threading.Timer(2  * 60, atualizar_pico, args=[nome, mint, "2min"]).start()
+    threading.Timer(10 * 60, atualizar_pico, args=[nome, mint, "10min"]).start()
+    threading.Timer(25 * 60, atualizar_pico, args=[nome, mint, "25min"]).start()
+
+
+def atualizar_pico(nome, mint, label):
+    """Verifica o MC atual e atualiza mc_pico se for maior — sem alterar checkpoints."""
+    est = estado[nome]
+    if mint not in est["pendentes"]:
+        return
+    info = est["pendentes"][mint]
+    reg  = est["registros"][info["idx"]]
+    db_id = info.get("db_id")
+    try:
+        _, mc_atual, _, _, _, _, _, _, _, _, _ = get_dados_token(mint)
+        if not mc_atual or mc_atual == 0:
+            return
+        mc_pico_atual = reg.get("mc_pico") or 0
+        if mc_atual > mc_pico_atual:
+            reg["mc_pico"] = mc_atual
+            log(f"  📈 [{nome}] Pico atualizado {label}: {reg['nome'][:20]} | MC: ${mc_atual:,.0f} (era ${mc_pico_atual:,.0f})")
+            if db_id:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE registros SET mc_pico=%s WHERE id=%s", (mc_atual, db_id))
+                    conn.commit()
+    except Exception as e:
+        log(f"⚠️  atualizar_pico erro [{label}]: {e}")
 
 
 def checar_checkpoint(nome, mint, checkpoint):
