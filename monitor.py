@@ -609,6 +609,15 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
 
     todas   = list(recentes.keys()) + [carteira_atual]
     humanos = [c for c in todas if TIPO_CARTEIRA.get(c) == "humano"]
+    # Salvar detalhes do multi para o dashboard
+    mints_globais[mint]["__multi_info__"] = {
+        "carteiras": todas,
+        "timing_s": timing_s,
+        "urgencia_nivel": 1 if timing_s < 120 else 2 if timing_s < 600 else 3,
+        "tem_humano": len(humanos) > 0,
+        "n_humanos": len(humanos),
+        "humanos": humanos,
+    }
     if humanos:
         urgencia = "⭐" * len(humanos) + " " + urgencia
 
@@ -1011,7 +1020,40 @@ def dados():
         for mint, info in estado[n]["pendentes"].items():
             ativos.append(dict(estado[n]["registros"][info["idx"]]))
 
-    multis = [r for r in todos_sorted if r.get("is_multi") and r.get("tipo") == "COMPRA"][:50]
+    # Agrupar multis por token_mint — mostrar todas as carteiras por token
+    multis_raw = [r for r in todos_sorted if r.get("is_multi") and r.get("tipo") == "COMPRA"]
+    multis_por_mint = {}
+    for r in multis_raw:
+        m = r["token_mint"]
+        if m not in multis_por_mint:
+            multis_por_mint[m] = []
+        multis_por_mint[m].append(r)
+
+    multis = []
+    for mint_m, regs_m in list(multis_por_mint.items())[:50]:
+        # Registro base = o mais recente
+        base = regs_m[0]
+        # Info extra do mints_globais se disponível
+        info_m = mints_globais.get(mint_m, {}).get("__multi_info__", {})
+        # Montar lista de entradas de cada carteira
+        entradas = []
+        for r in regs_m:
+            entradas.append({
+                "carteira": r["carteira"],
+                "tipo_carteira": TIPO_CARTEIRA.get(r["carteira"], "?"),
+                "mc_t0": r.get("mc_t0"),
+                "data_compra": r.get("data_compra"),
+                "var_t1_%": r.get("var_t1_%"),
+                "var_t2_%": r.get("var_t2_%"),
+                "var_t3_%": r.get("var_t3_%"),
+                "score_qualidade": r.get("score_qualidade"),
+            })
+        multi_entry = dict(base)
+        multi_entry["entradas"] = entradas
+        multi_entry["n_carteiras"] = len(regs_m)
+        multi_entry["tem_humano"] = any(TIPO_CARTEIRA.get(r["carteira"]) == "humano" for r in regs_m)
+        multi_entry["timing_s"] = info_m.get("timing_s")
+        multis.append(multi_entry)
 
     stats = {}
     for n in set(CARTEIRAS.values()):
