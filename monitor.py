@@ -975,7 +975,7 @@ def dados():
         "stats_carteiras": stats,
         "tokens_ativos":   ativos,
         "alertas_multi":   multis,
-        "historico":       todos_sorted[:200],
+        "historico":       [r for r in todos_sorted if r.get("categoria_final") and "aguardando" not in r.get("categoria_final", "")][:200],
     })
 
 
