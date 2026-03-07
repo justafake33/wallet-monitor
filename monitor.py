@@ -1020,11 +1020,20 @@ def dados():
         for mint, info in estado[n]["pendentes"].items():
             ativos.append(dict(estado[n]["registros"][info["idx"]]))
 
-    # Agrupar multis por token_mint — mostrar todas as carteiras por token
-    multis_raw = [r for r in todos_sorted if r.get("is_multi") and r.get("tipo") == "COMPRA"]
+    # Agrupar multis por token_mint — pegar TODAS as carteiras do token
+    # Primeiro: mints que têm pelo menos 1 registro is_multi=True
+    mints_multi = set(
+        r["token_mint"] for r in todos_sorted
+        if r.get("is_multi") and r.get("tipo") == "COMPRA"
+    )
+    # Depois: pegar TODOS os registros desses mints (inclusive quem comprou antes)
     multis_por_mint = {}
-    for r in multis_raw:
+    for r in todos_sorted:
+        if r.get("tipo") != "COMPRA":
+            continue
         m = r["token_mint"]
+        if m not in mints_multi:
+            continue
         if m not in multis_por_mint:
             multis_por_mint[m] = []
         multis_por_mint[m].append(r)
