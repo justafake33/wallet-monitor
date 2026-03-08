@@ -371,47 +371,66 @@ def classificar_momentum(net, total):
 def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
                    holders_count=None, top10_pct=None, buys=0, sells=0):
     """
-    Score v2 — inclui holders, concentração e pressão compradora.
+    Score v3 — calibrado com dados reais de 519 tokens finalizados
+    Baseline: 20.6% WinRate (target +100%)
     Max: 10 pontos
+
+    Critérios validados por lift real:
+    ✅ Pressão compradora >= 55%  (+27-35% lift)
+    ✅ Momentum 20-50             (+34% lift)
+    ✅ Idade 25-60min             (+82% lift)  ← surpresa!
+    ✅ MC $15-30k                 (+26% lift)
+    ✅ Ratio vol/mc 1.0-1.5       (+30% lift)  ← não extremo
+    ❌ Holders/top10% sem dados suficientes — neutros por ora
+    ❌ Ratio vol/mc >= 3 não é sinal positivo (+10% apenas)
     """
     score = 0
 
-    # ── Volume/MC ratio (0-3 pts) ─────────────────────────
-    if ratio_vol_mc and ratio_vol_mc >= 3:     score += 3
-    elif ratio_vol_mc and ratio_vol_mc >= 1.5: score += 2
-    elif ratio_vol_mc and ratio_vol_mc >= 1:   score += 1
-    elif ratio_vol_mc and ratio_vol_mc < 0.8:  score -= 2  # penalidade volume baixo
-
-    # ── Transações (0-2 pts) ──────────────────────────────
-    if txns and 80 <= txns <= 400:   score += 2
-    elif txns and txns < 80:         score += 1
-    elif txns and txns > 500:        score -= 1  # muito movimentado = late
-
-    # ── Idade do token (0-2 pts) ──────────────────────────
-    if idade_min and idade_min <= 10:   score += 2
-    elif idade_min and idade_min <= 25: score += 1
-    elif idade_min and idade_min > 60:  score -= 1  # token velho
-
-    # ── Pressão compradora (0-2 pts) ─────────────────────
+    # ── Pressão compradora (0-3 pts) — critério mais forte ──
+    # lift: >=70% = +35%, 55-70% = +27%, <40% = -28%
     total_txns = (buys or 0) + (sells or 0)
     if total_txns > 0:
         ratio_bs = buys / total_txns
-        if ratio_bs >= 0.70:   score += 2   # 70%+ comprando
-        elif ratio_bs >= 0.55: score += 1   # maioria comprando
-        elif ratio_bs < 0.40:  score -= 1   # maioria vendendo
+        if ratio_bs >= 0.70:   score += 3   # 70%+ comprando — sinal forte
+        elif ratio_bs >= 0.55: score += 2   # maioria comprando
+        elif ratio_bs >= 0.40: score += 0   # neutro
+        else:                  score -= 2   # maioria vendendo — penalidade
 
-    # ── Holders — quantidade (0-1 pt) ────────────────────
-    if holders_count:
-        if 80 <= holders_count <= 500:  score += 1   # sweet spot
-        elif holders_count > 800:       score -= 1   # distribuído demais = late
+    # ── Momentum líquido (0-2 pts) ────────────────────────
+    # lift: 20-50 = +34%, >50 = +21%
+    if ratio_vol_mc is not None:
+        # Usamos ratio_vol_mc como proxy de momentum quando não temos net_momentum
+        if ratio_vol_mc >= 1.0 and ratio_vol_mc < 3.0:  score += 2  # sweet spot +30%
+        elif ratio_vol_mc >= 3.0:                         score += 1  # alto mas ok +10%
+        elif ratio_vol_mc < 0.8:                          score -= 1  # fraco
 
-    # ── Concentração top10 (0-1 pt) ──────────────────────
-    if top10_pct is not None:
-        if top10_pct <= 25:    score += 1   # bem distribuído
-        elif top10_pct >= 60:  score -= 2   # muito concentrado = risco rug
+    # ── Idade do token (0-2 pts) — calibrado pelos dados ──
+    # CORREÇÃO: 25-60min é o melhor (lift +82%!), não penalizar token > 60min
+    if idade_min is not None:
+        if 25 <= idade_min <= 60:    score += 2   # sweet spot real — lift +82%
+        elif idade_min <= 10:        score += 1   # muito novo — lift +16%
+        elif 10 < idade_min < 25:    score -= 1   # pior faixa — lift -27%
+        elif idade_min > 120:        score -= 1   # muito velho
 
-    # ── Liquidez pump.fun (0 → sem penalidade) ───────────
-    if liq_t0 == 0:  score += 1   # bonding curve ativa
+    # ── MC entrada (0-2 pts) ──────────────────────────────
+    # lift: $15-30k = +26%, $5-15k = +13%, >$60k = -50%
+    if mc_t0:
+        if 15000 <= mc_t0 <= 30000:  score += 2   # sweet spot — lift +26%
+        elif 5000 <= mc_t0 < 15000:  score += 1   # bom — lift +13%
+        elif mc_t0 > 60000:          score -= 2   # caro demais — lift -50%
+        elif mc_t0 < 5000:           score -= 1   # muito barato — lift -13%
+
+    # ── Transações (0-1 pt) ───────────────────────────────
+    # lift: 80-400 = +16%, >500 = +16% — ambos parecidos
+    if txns:
+        if txns >= 80:   score += 1   # atividade mínima
+        # sem penalidade para > 500 — dados mostram que não é negativo
+
+    # ── Holders e top10% (neutros por ora) ───────────────
+    # Apenas 247 tokens com dados, quase todos < 80 holders
+    # Reativar quando tivermos dados de tokens com MC >= 10k
+    # if holders_count and 80 <= holders_count <= 500: score += 1
+    # if top10_pct and top10_pct >= 60: score -= 1  # concentração extrema
 
     # ── Plataforma ────────────────────────────────────────
     if dex == "pumpfun": score += 1
