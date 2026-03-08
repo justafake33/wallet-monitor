@@ -71,6 +71,18 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Migração: adicionar colunas holders T1/T2/T3 se não existirem
+            for col_name, col_type in [
+                ("holders_t1","INT"),("top1_t1","FLOAT"),("top10_t1","FLOAT"),("dev_saiu_t1","BOOLEAN"),
+                ("holders_t2","INT"),("top1_t2","FLOAT"),("top10_t2","FLOAT"),("dev_saiu_t2","BOOLEAN"),
+                ("holders_t3","INT"),("top1_t3","FLOAT"),("top10_t3","FLOAT"),("dev_saiu_t3","BOOLEAN"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE registros ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+                except Exception:
+                    pass
+            conn.commit()
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS registros (
                     id              SERIAL PRIMARY KEY,
@@ -102,6 +114,18 @@ def init_db():
                     top10_pct       FLOAT,
                     dev_saiu        BOOLEAN,
                     bc_progress     FLOAT,
+                    holders_t1      INT,
+                    top1_t1         FLOAT,
+                    top10_t1        FLOAT,
+                    dev_saiu_t1     BOOLEAN,
+                    holders_t2      INT,
+                    top1_t2         FLOAT,
+                    top10_t2        FLOAT,
+                    dev_saiu_t2     BOOLEAN,
+                    holders_t3      INT,
+                    top1_t3         FLOAT,
+                    top10_t3        FLOAT,
+                    dev_saiu_t3     BOOLEAN,
                     p_t1 FLOAT, mc_t1 FLOAT, liq_t1 FLOAT, volume_t1 FLOAT,
                     txns5m_t1 INT, buys_t1 INT, sells_t1 INT,
                     ratio_vol_mc_t1 FLOAT, var_t1 FLOAT, veredito_t1 TEXT,
@@ -170,6 +194,24 @@ def db_update_checkpoint(row_id, checkpoint, preco, mc, liq, volume, txns, buys,
                 WHERE id=%s
             """, (preco, mc, liq, volume, txns, buys, sells, ratio, var, veredito, mc_pico, row_id))
         conn.commit()
+
+
+def db_update_holders(db_id, checkpoint, holders, top1, top10, dev_saiu):
+    """Salva dados de holders no checkpoint especificado (t1, t2, t3)"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    UPDATE registros SET
+                        holders_{checkpoint} = %s,
+                        top1_{checkpoint}    = %s,
+                        top10_{checkpoint}   = %s,
+                        dev_saiu_{checkpoint}= %s
+                    WHERE id = %s
+                """, (holders, top1, top10, dev_saiu, db_id))
+            conn.commit()
+    except Exception as e:
+        log(f"db_update_holders erro: {e}")
 
 
 def db_update_final(row_id, mc_pico, var_pico, categoria):
@@ -502,6 +544,47 @@ def get_sol_price():
         return 0
 
 
+def get_dev_wallet(mint):
+    """
+    Busca a carteira do criador (dev) do token via Helius.
+    Na pump.fun, o dev é o feePayer da primeira transação do mint.
+    """
+    HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    try:
+        # Buscar as primeiras assinaturas do mint (a mais antiga = criação)
+        r = requests.post(HELIUS_URL,
+            json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress",
+                  "params":[mint, {"limit": 5, "commitment": "confirmed"}]},
+            timeout=8)
+        if r.status_code != 200:
+            return None
+        sigs = r.json().get("result", [])
+        if not sigs:
+            return None
+        # A última assinatura é a mais antiga (criação do token)
+        sig_criacao = sigs[-1].get("signature")
+        if not sig_criacao:
+            return None
+        # Buscar a transação de criação
+        r2 = requests.post(HELIUS_URL,
+            json={"jsonrpc":"2.0","id":1,"method":"getTransaction",
+                  "params":[sig_criacao, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]},
+            timeout=8)
+        if r2.status_code != 200:
+            return None
+        tx = r2.json().get("result", {})
+        if not tx:
+            return None
+        # feePayer é sempre o índice 0 dos accountKeys
+        account_keys = tx.get("transaction",{}).get("message",{}).get("accountKeys",[])
+        if account_keys:
+            dev = account_keys[0].get("pubkey") if isinstance(account_keys[0], dict) else account_keys[0]
+            return dev
+    except Exception as e:
+        log(f"get_dev_wallet erro: {e}")
+    return None
+
+
 def get_holder_data(mint, liq_t0=0, dev_wallet=None):
     """
     Busca holders, top1%, top10%, dev_saiu e bc_progress via Helius.
@@ -777,14 +860,23 @@ def checar_checkpoint(nome, mint, checkpoint):
         var_t1 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
         veredito = veredito_parcial(reg["mc_t0"], mc, "5min")
         mc_pico = max(mc, reg.get("mc_pico") or 0)
+        # Holders em T1 — só se MC >= 10k
+        h_t1 = top1_t1 = top10_t1 = dev_saiu_t1 = None
+        if mc and mc >= 10000:
+            dev_w = reg.get("dev_wallet")
+            h_t1, top1_t1, top10_t1, dev_saiu_t1, _ = get_holder_data(mint, liq_t0=liq, dev_wallet=dev_w)
+            log(f"  [T1 holders] {h_t1} top1={top1_t1} top10={top10_t1} dev_saiu={dev_saiu_t1}")
         reg.update({
             "p_t1": preco, "mc_t1": mc, "liq_t1": liq, "volume_t1": volume,
             "txns5m_t1": txns_5min, "buys_t1": buys, "sells_t1": sells,
             "ratio_vol_mc_t1": ratio, "var_t1_%": var_t1,
             "veredito_t1": veredito, "mc_pico": mc_pico,
+            "holders_t1": h_t1, "top1_t1": top1_t1, "top10_t1": top10_t1, "dev_saiu_t1": dev_saiu_t1,
         })
         if db_id:
             db_update_checkpoint(db_id, "t1", preco, mc, liq, volume, txns_5min, buys, sells, ratio, var_t1, veredito, mc_pico)
+            if h_t1 is not None:
+                db_update_holders(db_id, "t1", h_t1, top1_t1, top10_t1, dev_saiu_t1)
         log(f"  ⏱️  [{nome}] T1 {reg['nome'][:20]} | MC: ${mc:,.0f} | {veredito}")
         if reg.get("is_multi") and var_t1:
             if var_t1 >= 100:
@@ -796,14 +888,23 @@ def checar_checkpoint(nome, mint, checkpoint):
         var_t2 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
         veredito = veredito_parcial(reg.get("mc_t1"), mc, "15min")
         mc_pico = max(mc, reg.get("mc_pico") or 0)
+        # Holders em T2
+        h_t2 = top1_t2 = top10_t2 = dev_saiu_t2 = None
+        if mc and mc >= 10000:
+            dev_w = reg.get("dev_wallet")
+            h_t2, top1_t2, top10_t2, dev_saiu_t2, _ = get_holder_data(mint, liq_t0=liq, dev_wallet=dev_w)
+            log(f"  [T2 holders] {h_t2} top1={top1_t2} top10={top10_t2} dev_saiu={dev_saiu_t2}")
         reg.update({
             "p_t2": preco, "mc_t2": mc, "liq_t2": liq, "volume_t2": volume,
             "txns5m_t2": txns_5min, "buys_t2": buys, "sells_t2": sells,
             "ratio_vol_mc_t2": ratio, "var_t2_%": var_t2,
             "veredito_t2": veredito, "mc_pico": mc_pico,
+            "holders_t2": h_t2, "top1_t2": top1_t2, "top10_t2": top10_t2, "dev_saiu_t2": dev_saiu_t2,
         })
         if db_id:
             db_update_checkpoint(db_id, "t2", preco, mc, liq, volume, txns_5min, buys, sells, ratio, var_t2, veredito, mc_pico)
+            if h_t2 is not None:
+                db_update_holders(db_id, "t2", h_t2, top1_t2, top10_t2, dev_saiu_t2)
         log(f"  ⏱️  [{nome}] T2 {reg['nome'][:20]} | MC: ${mc:,.0f} | {veredito}")
 
     elif checkpoint == "t3":
@@ -812,12 +913,19 @@ def checar_checkpoint(nome, mint, checkpoint):
         mc_pico = max(mc, reg.get("mc_pico") or 0)
         var_pico = round((mc_pico - reg["mc_t0"]) / reg["mc_t0"] * 100, 2) if reg.get("mc_t0") else None
         cat = categoria_final({**reg, "mc_t3": mc})
+        # Holders em T3
+        h_t3 = top1_t3 = top10_t3 = dev_saiu_t3 = None
+        if mc and mc >= 10000:
+            dev_w = reg.get("dev_wallet")
+            h_t3, top1_t3, top10_t3, dev_saiu_t3, _ = get_holder_data(mint, liq_t0=liq, dev_wallet=dev_w)
+            log(f"  [T3 holders] {h_t3} top1={top1_t3} top10={top10_t3} dev_saiu={dev_saiu_t3}")
         reg.update({
             "p_t3": preco, "mc_t3": mc, "liq_t3": liq, "volume_t3": volume,
             "txns5m_t3": txns_5min, "buys_t3": buys, "sells_t3": sells,
             "ratio_vol_mc_t3": ratio, "var_t3_%": var_t3,
             "veredito_t3": veredito, "mc_pico": mc_pico,
             "var_pico_%": var_pico, "categoria_final": cat,
+            "holders_t3": h_t3, "top1_t3": top1_t3, "top10_t3": top10_t3, "dev_saiu_t3": dev_saiu_t3,
         })
         if db_id:
             db_update_checkpoint(db_id, "t3", preco, mc, liq, volume, txns_5min, buys, sells, ratio, var_t3, veredito, mc_pico)
@@ -863,7 +971,22 @@ def processar_tx(tx, carteira_addr, nome):
         # Buscar holders ANTES do score para incluir no cálculo
         holders_count = top1_pct = top10_pct = dev_saiu = bc_progress = None
         try:
-            holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0)
+            # Holders só fazem sentido com MC >= $10k
+            # Abaixo disso o token tem só dev + sniper bots — dado enganoso
+            if mc_t0 and mc_t0 >= 10000:
+                dev_wallet = get_dev_wallet(mint)
+                holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0, dev_wallet=dev_wallet)
+                # Salvar dev_wallet no estado para usar em T1/T2/T3
+                for n in estado:
+                    for r in estado[n]["registros"]:
+                        if r.get("token_mint") == mint and r.get("tipo") == "COMPRA":
+                            r["dev_wallet"] = dev_wallet
+                            break
+            else:
+                # bc_progress ainda faz sentido em qualquer MC
+                if liq_t0 and liq_t0 > 0:
+                    TARGET_LIQ_USD = 11050
+                    bc_progress = min(round(liq_t0 / TARGET_LIQ_USD * 100, 1), 99.0)
         except Exception as e:
             log(f"holders erro [{nome_token}]: {e}")
 
