@@ -326,19 +326,54 @@ def classificar_momentum(net, total):
     return "🧊 Vendendo forte"
 
 
-def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex):
+def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
+                   holders_count=None, top10_pct=None, buys=0, sells=0):
+    """
+    Score v2 — inclui holders, concentração e pressão compradora.
+    Max: 10 pontos
+    """
     score = 0
+
+    # ── Volume/MC ratio (0-3 pts) ─────────────────────────
     if ratio_vol_mc and ratio_vol_mc >= 3:     score += 3
     elif ratio_vol_mc and ratio_vol_mc >= 1.5: score += 2
     elif ratio_vol_mc and ratio_vol_mc >= 1:   score += 1
-    if txns and 100 <= txns <= 450:            score += 2
-    elif txns and txns < 100:                  score += 1
-    elif txns and txns > 500:                  score -= 2
-    if liq_t0 == 0:                            score += 2
-    if idade_min and idade_min <= 15:          score += 2
-    elif idade_min and idade_min <= 30:        score += 1
-    if dex == "pumpfun":                       score += 1
-    if ratio_vol_mc and ratio_vol_mc < 0.8:    score -= 2
+    elif ratio_vol_mc and ratio_vol_mc < 0.8:  score -= 2  # penalidade volume baixo
+
+    # ── Transações (0-2 pts) ──────────────────────────────
+    if txns and 80 <= txns <= 400:   score += 2
+    elif txns and txns < 80:         score += 1
+    elif txns and txns > 500:        score -= 1  # muito movimentado = late
+
+    # ── Idade do token (0-2 pts) ──────────────────────────
+    if idade_min and idade_min <= 10:   score += 2
+    elif idade_min and idade_min <= 25: score += 1
+    elif idade_min and idade_min > 60:  score -= 1  # token velho
+
+    # ── Pressão compradora (0-2 pts) ─────────────────────
+    total_txns = (buys or 0) + (sells or 0)
+    if total_txns > 0:
+        ratio_bs = buys / total_txns
+        if ratio_bs >= 0.70:   score += 2   # 70%+ comprando
+        elif ratio_bs >= 0.55: score += 1   # maioria comprando
+        elif ratio_bs < 0.40:  score -= 1   # maioria vendendo
+
+    # ── Holders — quantidade (0-1 pt) ────────────────────
+    if holders_count:
+        if 80 <= holders_count <= 500:  score += 1   # sweet spot
+        elif holders_count > 800:       score -= 1   # distribuído demais = late
+
+    # ── Concentração top10 (0-1 pt) ──────────────────────
+    if top10_pct is not None:
+        if top10_pct <= 25:    score += 1   # bem distribuído
+        elif top10_pct >= 60:  score -= 2   # muito concentrado = risco rug
+
+    # ── Liquidez pump.fun (0 → sem penalidade) ───────────
+    if liq_t0 == 0:  score += 1   # bonding curve ativa
+
+    # ── Plataforma ────────────────────────────────────────
+    if dex == "pumpfun": score += 1
+
     score = max(0, min(10, score))
     if score >= 7:   return score, "🟢", "ALTA CONFIANÇA"
     elif score >= 4: return score, "🟡", "MODERADO"
@@ -468,79 +503,78 @@ def get_sol_price():
 
 
 def get_holder_data(mint, liq_t0=0, dev_wallet=None):
+    """
+    Busca holders, top1%, top10%, dev_saiu e bc_progress via Helius.
+    pump.fun bloqueada por Cloudflare — usando 100% Helius.
+    3 requests: getTokenSupply + getTokenLargestAccounts + getTokenAccounts
+    """
     holders_count = top1_pct = top10_pct = dev_saiu = bc_progress = None
-    if liq_t0 == 0:
-        try:
-            r = requests.get(
-                f"https://frontend-api.pump.fun/coins/{mint}",
-                timeout=8, headers={"User-Agent": "Mozilla/5.0"},
-            )
-            if r.status_code == 200:
-                data          = r.json()
-                holders_count = data.get("holder_count")
-                bc_progress   = data.get("bonding_curve_progress")
-                dev_wallet_bc = data.get("creator")
-                if dev_wallet_bc:
-                    try:
-                        r2 = requests.get(
-                            f"https://frontend-api.pump.fun/coins/{mint}/holders",
-                            timeout=8, headers={"User-Agent": "Mozilla/5.0"},
-                        )
-                        if r2.status_code == 200:
-                            holders_list = r2.json()
-                            top_wallets  = [h.get("owner", "") for h in holders_list[:20]]
-                            dev_saiu     = dev_wallet_bc not in top_wallets
-                            total_supply = 1_000_000_000
-                            # Endereços conhecidos de LP e bonding curve — excluir do cálculo
-                            LP_ADDRESSES = {
-                                "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",  # pump.fun bonding curve
-                                "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1", # raydium LP
-                                "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1", # raydium authority
-                            }
-                            holders_validos = [h for h in holders_list if h.get("owner","") not in LP_ADDRESSES]
-                            if holders_validos:
-                                top10_pct = round(sum(h.get("balance", 0) for h in holders_validos[:10]) / total_supply * 100, 1)
-                                # top1 excluindo LP (para referência interna, não exibido)
-                                top1_pct  = round(holders_validos[0].get("balance", 0) / total_supply * 100, 1)
-                    except:
-                        pass
-        except Exception as e:
-            log(f"pump.fun holder erro: {e}")
-        return holders_count, top1_pct, top10_pct, dev_saiu, bc_progress
+
+    HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+    # Endereços de LP e bonding curve a excluir
+    LP_KNOWN = {
+        "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",  # pump.fun bonding curve
+        "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",  # raydium LP
+        "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  # raydium authority
+        "HVh6wHNBAsG3pq1Bj5oCzRjoWKVogEDHwUHkRz3ekFgt",  # raydium pool
+        "4wTV81avi27QFu8BcXVFEQhaqHXRv7r4f3BCQBFR6SJ1",  # pump.fun fee
+    }
+
     try:
-        r = requests.post(
-            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]},
-            timeout=8,
-        )
+        # ── 1. Supply total ───────────────────────────────────
+        r1 = requests.post(HELIUS_URL,
+            json={"jsonrpc":"2.0","id":1,"method":"getTokenSupply","params":[mint]},
+            timeout=8)
         total_supply = 0
-        if r.status_code == 200:
-            total_supply = float(r.json().get("result", {}).get("value", {}).get("uiAmount", 0))
+        if r1.status_code == 200:
+            total_supply = float(r1.json().get("result",{}).get("value",{}).get("uiAmount", 0))
+
+        # ── 2. Top 20 holders → top1% e top10% ───────────────
         if total_supply > 0:
-            r2 = requests.post(
-                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]},
-                timeout=8,
-            )
+            r2 = requests.post(HELIUS_URL,
+                json={"jsonrpc":"2.0","id":1,"method":"getTokenLargestAccounts","params":[mint]},
+                timeout=8)
             if r2.status_code == 200:
-                accounts = r2.json().get("result", {}).get("value", [])
-                if accounts:
-                    # Filtrar endereços de LP conhecidos
-                    LP_KNOWN = {
-                        "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",
-                        "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
-                        "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
-                        "HVh6wHNBAsG3pq1Bj5oCzRjoWKVogEDHwUHkRz3ekFgt",  # raydium pool
-                    }
-                    accs_validos = [a for a in accounts if a.get("address","") not in LP_KNOWN]
-                    holders_count = len(accs_validos)
-                    if accs_validos:
-                        top10_pct = round(sum(float(a.get("uiAmount", 0)) for a in accs_validos[:10]) / total_supply * 100, 1)
-                        top1_pct  = round(float(accs_validos[0].get("uiAmount", 0)) / total_supply * 100, 1)
-                    if dev_wallet:
-                        dev_saiu = dev_wallet not in [a.get("address", "") for a in accs_validos]
+                accounts = r2.json().get("result",{}).get("value",[])
+                accs_validos = [a for a in accounts if a.get("address","") not in LP_KNOWN]
+                if accs_validos:
+                    top1_pct  = round(float(accs_validos[0].get("uiAmount",0)) / total_supply * 100, 1)
+                    top10_pct = round(sum(float(a.get("uiAmount",0)) for a in accs_validos[:10]) / total_supply * 100, 1)
+                if dev_wallet:
+                    dev_saiu = dev_wallet not in [a.get("address","") for a in accs_validos]
+
+        # ── 3. Holders count real via getTokenAccounts ────────
+        r3 = requests.post(HELIUS_URL,
+            json={"jsonrpc":"2.0","id":1,"method":"getTokenAccounts",
+                  "params":{"mint": mint, "limit": 1000, "page": 1}},
+            timeout=10)
+        if r3.status_code == 200:
+            token_accounts = r3.json().get("result",{}).get("token_accounts",[])
+            # Filtrar contas com balance zero e LPs
+            contas_validas = [
+                a for a in token_accounts
+                if a.get("amount", 0) > 0
+                and a.get("owner","") not in LP_KNOWN
+            ]
+            count = len(contas_validas)
+            holders_count = count if count < 1000 else 1000
+            log(f"  holders={holders_count} top1={top1_pct} top10={top10_pct} dev_saiu={dev_saiu}")
+
+        # ── 4. bc_progress estimado pela liquidez ─────────────
+        # pump.fun migra com ~85 SOL de liquidez
+        # liq_t0 está em USD — estimamos pelo preço do SOL via supply/mc implícito
+        if liq_t0 and liq_t0 > 0:
+            # Estimativa conservadora: SOL ~$130, target ~85 SOL = ~$11050
+            TARGET_LIQ_USD = 11050
+            bc_progress = min(round(liq_t0 / TARGET_LIQ_USD * 100, 1), 99.0)
+            # Se liq > target, token provavelmente já migrou ou está migrando
+            if liq_t0 >= TARGET_LIQ_USD:
+                bc_progress = 99.0
+
     except Exception as e:
         log(f"helius holder erro: {e}")
+
     return holders_count, top1_pct, top10_pct, dev_saiu, bc_progress
 
 
@@ -826,13 +860,18 @@ def processar_tx(tx, carteira_addr, nome):
 
         ratio_vol_mc_t0 = round(volume_t0 / mc_t0, 2) if mc_t0 > 0 else None
         token_antigo    = "sim" if (idade_min and idade_min > 1440) else "não"
-        score, score_emoji, score_desc = calcular_score(mc_t0, liq_t0, txns_5min, ratio_vol_mc_t0, idade_min, dex)
-
+        # Buscar holders ANTES do score para incluir no cálculo
         holders_count = top1_pct = top10_pct = dev_saiu = bc_progress = None
         try:
             holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0)
         except Exception as e:
             log(f"holders erro [{nome_token}]: {e}")
+
+        score, score_emoji, score_desc = calcular_score(
+            mc_t0, liq_t0, txns_5min, ratio_vol_mc_t0, idade_min, dex,
+            holders_count=holders_count, top10_pct=top10_pct,
+            buys=buys_5min, sells=sells_5min
+        )
 
         flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
         # Token sem MC — registra no mints_globais para alertas multi funcionarem
