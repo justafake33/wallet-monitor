@@ -83,6 +83,20 @@ def init_db():
                     pass
             conn.commit()
 
+            # Tabela de histórico de deployers
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS deployers (
+                    dev_wallet      TEXT PRIMARY KEY,
+                    tokens_total    INT DEFAULT 0,
+                    tokens_rug      INT DEFAULT 0,
+                    tokens_migrou   INT DEFAULT 0,
+                    rug_rate        FLOAT DEFAULT 0,
+                    classificacao   TEXT DEFAULT 'desconhecido',
+                    ultima_update   TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            conn.commit()
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS registros (
                     id              SERIAL PRIMARY KEY,
@@ -369,73 +383,78 @@ def classificar_momentum(net, total):
 
 
 def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
-                   holders_count=None, top10_pct=None, buys=0, sells=0):
+                   holders_count=None, top10_pct=None, buys=0, sells=0,
+                   dev_classif=None, hora_utc=None):
     """
-    Score v3 — calibrado com dados reais de 519 tokens finalizados
+    Score v4 — calibrado com dados reais + histórico do deployer + hora do dia
     Baseline: 20.6% WinRate (target +100%)
-    Max: 10 pontos
-
-    Critérios validados por lift real:
-    ✅ Pressão compradora >= 55%  (+27-35% lift)
-    ✅ Momentum 20-50             (+34% lift)
-    ✅ Idade 25-60min             (+82% lift)  ← surpresa!
-    ✅ MC $15-30k                 (+26% lift)
-    ✅ Ratio vol/mc 1.0-1.5       (+30% lift)  ← não extremo
-    ❌ Holders/top10% sem dados suficientes — neutros por ora
-    ❌ Ratio vol/mc >= 3 não é sinal positivo (+10% apenas)
+    Max: 10 pontos (+ multiplicador de hora)
     """
     score = 0
 
+    # ── BLOQUEIO IMEDIATO — serial rugger ─────────────────
+    # Dev com >= 80% de rug rate — não importa nada mais
+    if dev_classif == "serial_rugger":
+        return 0, "💀", "SERIAL RUGGER — BLOQUEADO"
+
     # ── Pressão compradora (0-3 pts) — critério mais forte ──
-    # lift: >=70% = +35%, 55-70% = +27%, <40% = -28%
     total_txns = (buys or 0) + (sells or 0)
     if total_txns > 0:
         ratio_bs = buys / total_txns
-        if ratio_bs >= 0.70:   score += 3   # 70%+ comprando — sinal forte
-        elif ratio_bs >= 0.55: score += 2   # maioria comprando
-        elif ratio_bs >= 0.40: score += 0   # neutro
-        else:                  score -= 2   # maioria vendendo — penalidade
+        if ratio_bs >= 0.70:   score += 3
+        elif ratio_bs >= 0.55: score += 2
+        elif ratio_bs >= 0.40: score += 0
+        else:                  score -= 2
 
-    # ── Momentum líquido (0-2 pts) ────────────────────────
-    # lift: 20-50 = +34%, >50 = +21%
+    # ── Ratio Vol/MC (0-2 pts) ────────────────────────────
     if ratio_vol_mc is not None:
-        # Usamos ratio_vol_mc como proxy de momentum quando não temos net_momentum
-        if ratio_vol_mc >= 1.0 and ratio_vol_mc < 3.0:  score += 2  # sweet spot +30%
-        elif ratio_vol_mc >= 3.0:                         score += 1  # alto mas ok +10%
-        elif ratio_vol_mc < 0.8:                          score -= 1  # fraco
+        if 1.0 <= ratio_vol_mc < 3.0:  score += 2   # sweet spot +30%
+        elif ratio_vol_mc >= 3.0:       score += 1   # alto mas ok
+        elif ratio_vol_mc < 0.8:        score -= 1
 
-    # ── Idade do token (0-2 pts) — calibrado pelos dados ──
-    # CORREÇÃO: 25-60min é o melhor (lift +82%!), não penalizar token > 60min
+    # ── Idade do token (0-2 pts) ──────────────────────────
     if idade_min is not None:
-        if 25 <= idade_min <= 60:    score += 2   # sweet spot real — lift +82%
-        elif idade_min <= 10:        score += 1   # muito novo — lift +16%
-        elif 10 < idade_min < 25:    score -= 1   # pior faixa — lift -27%
-        elif idade_min > 120:        score -= 1   # muito velho
+        if 25 <= idade_min <= 60:    score += 2   # lift +82%
+        elif idade_min <= 10:        score += 1   # lift +16%
+        elif 10 < idade_min < 25:    score -= 1   # pior faixa
+        elif idade_min > 120:        score -= 1
 
     # ── MC entrada (0-2 pts) ──────────────────────────────
-    # lift: $15-30k = +26%, $5-15k = +13%, >$60k = -50%
     if mc_t0:
-        if 15000 <= mc_t0 <= 30000:  score += 2   # sweet spot — lift +26%
-        elif 5000 <= mc_t0 < 15000:  score += 1   # bom — lift +13%
-        elif mc_t0 > 60000:          score -= 2   # caro demais — lift -50%
-        elif mc_t0 < 5000:           score -= 1   # muito barato — lift -13%
+        if 15000 <= mc_t0 <= 30000:  score += 2   # lift +26%
+        elif 5000 <= mc_t0 < 15000:  score += 1   # lift +13%
+        elif mc_t0 > 60000:          score -= 2   # lift -50%
+        elif mc_t0 < 5000:           score -= 1
 
     # ── Transações (0-1 pt) ───────────────────────────────
-    # lift: 80-400 = +16%, >500 = +16% — ambos parecidos
-    if txns:
-        if txns >= 80:   score += 1   # atividade mínima
-        # sem penalidade para > 500 — dados mostram que não é negativo
-
-    # ── Holders e top10% (neutros por ora) ───────────────
-    # Apenas 247 tokens com dados, quase todos < 80 holders
-    # Reativar quando tivermos dados de tokens com MC >= 10k
-    # if holders_count and 80 <= holders_count <= 500: score += 1
-    # if top10_pct and top10_pct >= 60: score -= 1  # concentração extrema
+    if txns and txns >= 80:
+        score += 1
 
     # ── Plataforma ────────────────────────────────────────
-    if dex == "pumpfun": score += 1
+    if dex == "pumpfun":
+        score += 1
 
+    # ── Histórico do deployer (bônus/penalidade) ──────────
+    if dev_classif == "confiavel":      score += 2   # dev com histórico limpo
+    elif dev_classif == "misto":        score += 0   # neutro
+    elif dev_classif == "rugger":       score -= 3   # penalidade forte
+    elif dev_classif == "novo":         score += 0   # sem histórico = neutro
+    # serial_rugger já foi bloqueado acima
+
+    # ── Score base finalizado ─────────────────────────────
     score = max(0, min(10, score))
+
+    # ── Multiplicador de hora UTC ─────────────────────────
+    # Baseado nos dados: 02-08h UTC melhor WR, 18-20h UTC pior
+    if hora_utc is not None:
+        if 2 <= hora_utc < 8:
+            multiplicador = 1.15   # horário bom
+        elif 18 <= hora_utc < 20:
+            multiplicador = 0.85   # horário ruim
+        else:
+            multiplicador = 1.0
+        score = round(min(10, score * multiplicador))
+
     if score >= 7:   return score, "🟢", "ALTA CONFIANÇA"
     elif score >= 4: return score, "🟡", "MODERADO"
     else:            return score, "🔴", "BAIXA CONFIANÇA"
@@ -602,6 +621,163 @@ def get_dev_wallet(mint):
     except Exception as e:
         log(f"get_dev_wallet erro: {e}")
     return None
+
+
+def get_deployer_history(dev_wallet):
+    """
+    Busca histórico do deployer via Helius.
+    Analisa tokens anteriores lançados pelo mesmo dev e classifica:
+    - serial_rugger: rug_rate >= 80%  → score = 0
+    - rugger:        rug_rate >= 50%  → penalidade forte
+    - misto:         rug_rate 20-50%  → neutro
+    - confiavel:     rug_rate < 20%   → bônus
+    - novo:          0 tokens antes   → neutro
+    
+    Define "rug" como: token caiu > 80% dentro de 1h do lançamento.
+    Usa pump.fun API via Helius getSignaturesForAddress.
+    """
+    if not dev_wallet:
+        return None, None, None, "desconhecido"
+
+    HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+    try:
+        # Verificar cache no banco primeiro
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT tokens_total, tokens_rug, rug_rate, classificacao, ultima_update
+                    FROM deployers WHERE dev_wallet = %s
+                """, (dev_wallet,))
+                row = cur.fetchone()
+                if row:
+                    # Cache válido por 6 horas
+                    from datetime import datetime, timezone
+                    ultima = row[4]
+                    if ultima and (datetime.now() - ultima.replace(tzinfo=None)).seconds < 21600:
+                        return row[0], row[1], row[2], row[3]
+
+        # Buscar transações do dev wallet
+        r = requests.post(HELIUS_URL,
+            json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress",
+                  "params":[dev_wallet, {"limit": 100, "commitment": "confirmed"}]},
+            timeout=10)
+        if r.status_code != 200:
+            return None, None, None, "desconhecido"
+
+        sigs = r.json().get("result", [])
+        if not sigs:
+            return 0, 0, 0.0, "novo"
+
+        # Filtrar transações de criação de token (pump.fun)
+        # Buscar detalhes de cada sig para encontrar mints criados
+        tokens_lancados = []
+        for sig_info in sigs[:50]:  # limitar a 50 para não estourar requests
+            sig = sig_info.get("signature")
+            if not sig:
+                continue
+            try:
+                r2 = requests.post(HELIUS_URL,
+                    json={"jsonrpc":"2.0","id":1,"method":"getTransaction",
+                          "params":[sig, {"encoding":"jsonParsed",
+                                         "maxSupportedTransactionVersion":0}]},
+                    timeout=8)
+                if r2.status_code != 200:
+                    continue
+                tx = r2.json().get("result", {})
+                if not tx:
+                    continue
+
+                # Verificar se é uma transação pump.fun de criação
+                log_msgs = tx.get("meta", {}).get("logMessages", [])
+                is_pumpfun_create = any(
+                    "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke" in m
+                    for m in log_msgs
+                ) and any("create" in m.lower() for m in log_msgs)
+
+                if not is_pumpfun_create:
+                    continue
+
+                # Extrair mint criado
+                post_balances = tx.get("meta", {}).get("postTokenBalances", [])
+                for bal in post_balances:
+                    mint_addr = bal.get("mint")
+                    if mint_addr and mint_addr not in tokens_lancados:
+                        tokens_lancados.append(mint_addr)
+                        break
+            except:
+                continue
+
+        if not tokens_lancados:
+            return 0, 0, 0.0, "novo"
+
+        # Analisar cada token lançado — verificar se rugou
+        tokens_rug = 0
+        for mint_addr in tokens_lancados[:20]:  # max 20 tokens para analisar
+            try:
+                # Buscar primeiras transações do token para ver variação de preço
+                r3 = requests.post(HELIUS_URL,
+                    json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress",
+                          "params":[mint_addr, {"limit": 10}]},
+                    timeout=8)
+                if r3.status_code != 200:
+                    continue
+                sigs_token = r3.json().get("result", [])
+                if len(sigs_token) < 2:
+                    # Token com poucas transações = morreu rápido = rug
+                    tokens_rug += 1
+                    continue
+
+                # Verificar tempo de vida — se a última tx foi < 1h após a primeira = rug
+                primeiro_ts = sigs_token[-1].get("blockTime", 0)
+                ultimo_ts   = sigs_token[0].get("blockTime", 0)
+                tempo_vida_min = (ultimo_ts - primeiro_ts) / 60 if primeiro_ts else 999
+
+                if tempo_vida_min < 60 and len(sigs_token) < 5:
+                    tokens_rug += 1
+            except:
+                continue
+
+        total = len(tokens_lancados)
+        rug_rate = round(tokens_rug / total, 2) if total > 0 else 0
+
+        # Classificar
+        if total == 0:
+            classif = "novo"
+        elif rug_rate >= 0.80:
+            classif = "serial_rugger"
+        elif rug_rate >= 0.50:
+            classif = "rugger"
+        elif rug_rate >= 0.20:
+            classif = "misto"
+        else:
+            classif = "confiavel"
+
+        log(f"  [deployer] {dev_wallet[:8]}... | tokens={total} rugs={tokens_rug} rate={rug_rate:.0%} → {classif}")
+
+        # Salvar no cache
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO deployers (dev_wallet, tokens_total, tokens_rug, rug_rate, classificacao, ultima_update)
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (dev_wallet) DO UPDATE SET
+                            tokens_total = EXCLUDED.tokens_total,
+                            tokens_rug   = EXCLUDED.tokens_rug,
+                            rug_rate     = EXCLUDED.rug_rate,
+                            classificacao= EXCLUDED.classificacao,
+                            ultima_update= NOW()
+                    """, (dev_wallet, total, tokens_rug, rug_rate, classif))
+                conn.commit()
+        except Exception as e:
+            log(f"  deployer cache erro: {e}")
+
+        return total, tokens_rug, rug_rate, classif
+
+    except Exception as e:
+        log(f"get_deployer_history erro: {e}")
+        return None, None, None, "desconhecido"
 
 
 def get_holder_data(mint, liq_t0=0, dev_wallet=None):
@@ -995,11 +1171,16 @@ def processar_tx(tx, carteira_addr, nome):
             if mc_t0 and mc_t0 >= 10000:
                 dev_wallet = get_dev_wallet(mint)
                 holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0, dev_wallet=dev_wallet)
-                # Salvar dev_wallet no estado para usar em T1/T2/T3
+                # Histórico do deployer
+                dev_tokens_total, dev_tokens_rug, dev_rug_rate, dev_classif = get_deployer_history(dev_wallet)
+                # Salvar dev_wallet e classificação no estado para usar em T1/T2/T3 e score
                 for n in estado:
                     for r in estado[n]["registros"]:
                         if r.get("token_mint") == mint and r.get("tipo") == "COMPRA":
-                            r["dev_wallet"] = dev_wallet
+                            r["dev_wallet"]       = dev_wallet
+                            r["dev_classif"]      = dev_classif
+                            r["dev_rug_rate"]     = dev_rug_rate
+                            r["dev_tokens_total"] = dev_tokens_total
                             break
             else:
                 # bc_progress ainda faz sentido em qualquer MC
@@ -1009,10 +1190,19 @@ def processar_tx(tx, carteira_addr, nome):
         except Exception as e:
             log(f"holders erro [{nome_token}]: {e}")
 
+        # Pegar dev_classif do registro se já foi calculado
+        dev_classif_score = None
+        for n in estado:
+            for r in estado[n]["registros"]:
+                if r.get("token_mint") == mint and r.get("tipo") == "COMPRA":
+                    dev_classif_score = r.get("dev_classif")
+                    break
         score, score_emoji, score_desc = calcular_score(
             mc_t0, liq_t0, txns_5min, ratio_vol_mc_t0, idade_min, dex,
             holders_count=holders_count, top10_pct=top10_pct,
-            buys=buys_5min, sells=sells_5min
+            buys=buys_5min, sells=sells_5min,
+            dev_classif=dev_classif_score,
+            hora_utc=__import__("datetime").datetime.utcnow().hour
         )
 
         flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
