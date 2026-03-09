@@ -1017,7 +1017,8 @@ def agendar_checkpoints(nome, mint):
 
 
 def atualizar_pico(nome, mint, label):
-    """Verifica o MC atual e atualiza mc_pico se for maior — sem alterar checkpoints."""
+    """Verifica o MC atual e atualiza mc_pico se for maior — sem alterar checkpoints.
+    No snapshot de 2min também captura aceleração de txns para o score."""
     est = estado[nome]
     if mint not in est["pendentes"]:
         return
@@ -1025,9 +1026,11 @@ def atualizar_pico(nome, mint, label):
     reg  = est["registros"][info["idx"]]
     db_id = info.get("db_id")
     try:
-        _, mc_atual, _, _, _, _, _, _, _, _, _ = get_dados_token(mint)
+        _, mc_atual, _, _, _, txns_atual, _, _, _, buys_atual, sells_atual = get_dados_token(mint)
         if not mc_atual or mc_atual == 0:
             return
+
+        # ── Atualizar mc_pico ─────────────────────────────
         mc_pico_atual = reg.get("mc_pico") or 0
         if mc_atual > mc_pico_atual:
             reg["mc_pico"] = mc_atual
@@ -1037,6 +1040,44 @@ def atualizar_pico(nome, mint, label):
                     with conn.cursor() as cur:
                         cur.execute("UPDATE registros SET mc_pico=%s WHERE id=%s", (mc_atual, db_id))
                     conn.commit()
+
+        # ── Capturar aceleração no snapshot de 2min ───────
+        if label == "2min" and txns_atual is not None:
+            txns_t0 = reg.get("txns5m_t0") or 0
+            # Aceleração = txns atuais vs txns em T0
+            # >3x = acelerando forte, 1.5-3x = crescendo, <0.8x = esfriando
+            acel = round(txns_atual / txns_t0, 2) if txns_t0 > 0 else None
+            reg["aceleracao_2min"] = acel
+            reg["txns_2min"]       = txns_atual
+            reg["buys_2min"]       = buys_atual
+            reg["sells_2min"]      = sells_atual
+
+            if acel:
+                if acel >= 3:    emoji = "🚀"
+                elif acel >= 1.5: emoji = "📈"
+                elif acel < 0.8:  emoji = "📉"
+                else:             emoji = "➡️"
+                log(f"  ⚡ [{nome}] Acel 2min: {reg['nome'][:20]} | txns: {txns_t0}→{txns_atual} ({acel}x) {emoji}")
+
+            # Recalcular score com aceleração
+            score_atual = reg.get("score_qualidade") or 0
+            bonus_acel = 0
+            if acel is not None:
+                if acel >= 3:    bonus_acel = 1    # acelerando forte
+                elif acel < 0.8: bonus_acel = -1   # esfriando
+            if bonus_acel != 0:
+                novo_score = max(0, min(10, score_atual + bonus_acel))
+                reg["score_qualidade"] = novo_score
+                if novo_score >= 7:   reg["score_emoji"] = "🟢"
+                elif novo_score >= 4: reg["score_emoji"] = "🟡"
+                else:                 reg["score_emoji"] = "🔴"
+                log(f"  🔄 [{nome}] Score ajustado por aceleração: {score_atual}→{novo_score} (acel={acel}x)")
+                if db_id:
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("UPDATE registros SET score_qualidade=%s WHERE id=%s", (novo_score, db_id))
+                        conn.commit()
+
     except Exception as e:
         log(f"⚠️  atualizar_pico erro [{label}]: {e}")
 
