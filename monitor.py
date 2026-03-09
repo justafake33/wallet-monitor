@@ -1353,6 +1353,65 @@ def processar_tx(tx, carteira_addr, nome):
         agendar_checkpoints(nome, mint)
 
 
+def verificar_calibracao():
+    """Roda diariamente — verifica se dados estão prontos para calibrar o score."""
+    try:
+        import pandas as pd
+        from sqlalchemy import create_engine, text as sa_text
+
+        engine = create_engine(DB_URL)
+        df = pd.read_sql(sa_text("""
+            SELECT holders_count, top10_pct, dev_classif, aceleracao_2min,
+                   holders_t1, holders_t3, var_pico, data_compra
+            FROM registros
+            WHERE tipo = 'COMPRA'
+              AND categoria_final IS NOT NULL
+              AND categoria_final NOT ILIKE '%aguardando%'
+              AND var_pico IS NOT NULL
+        """), engine)
+
+        total = len(df)
+        MIN_TOTAL    = 800
+        MIN_CRITERIO = 30
+
+        novos_prontos = []
+        for col, nome in [
+            ("holders_count",  "holders T0"),
+            ("top10_pct",      "top10 T0"),
+            ("holders_t1",     "holders T1"),
+            ("holders_t3",     "holders T3"),
+            ("dev_classif",    "dev_classif"),
+            ("aceleracao_2min","aceleração 2min"),
+        ]:
+            if col in df.columns and df[col].notna().sum() >= MIN_CRITERIO:
+                novos_prontos.append(nome)
+
+        log(f"[calibração] {total} tokens | critérios novos prontos: {len(novos_prontos)}")
+
+        if total >= MIN_TOTAL and len(novos_prontos) >= 3:
+            msg = (
+                f"🧠 <b>CALIBRAÇÃO DO SCORE DISPONÍVEL</b>\n\n"
+                f"Os dados já permitem recalibrar o score com novos critérios.\n\n"
+                f"📊 <b>{total}</b> tokens finalizados\n"
+                f"✅ Critérios novos prontos: <b>{len(novos_prontos)}</b>\n"
+                + "".join([f"\n  • {c}" for c in novos_prontos]) +
+                f"\n\n💡 Rode <code>calibrar_score.py</code> no Colab para ver os novos pesos.\n"
+                f"📅 {__import__('datetime').datetime.now().strftime('%d/%m/%Y %H:%M')}"
+            )
+            telegram(msg)
+            log("[calibração] ✅ Alerta enviado no Telegram!")
+        elif total >= MIN_TOTAL:
+            log(f"[calibração] 🟡 Tokens suficientes mas critérios novos insuficientes ({len(novos_prontos)}/3)")
+        else:
+            log(f"[calibração] 🔴 Faltam {MIN_TOTAL - total} tokens para o mínimo")
+
+    except Exception as e:
+        log(f"[calibração] erro: {e}")
+
+    # Reagendar para amanhã
+    threading.Timer(24 * 60 * 60, verificar_calibracao).start()
+
+
 def enviar_csv_diario():
     log("📤 Enviando CSV diário...")
     todos = []
@@ -1524,6 +1583,8 @@ def startup():
     )
     log("✅ Monitor v6.3+db — aguardando transações")
     threading.Timer(24 * 60 * 60, enviar_csv_diario).start()
+    threading.Timer(6 * 60 * 60, verificar_calibracao).start()
+    log("🧠 Verificação de calibração agendada (6h)")
 
 
 if __name__ == "__main__":
