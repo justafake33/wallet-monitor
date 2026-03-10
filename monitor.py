@@ -1268,6 +1268,7 @@ def processar_tx(tx, carteira_addr, nome):
                 if r.get("token_mint") == mint and r.get("tipo") == "COMPRA":
                     dev_classif_score = r.get("dev_classif")
                     break
+        is_multi = False  # será atualizado após checar_multi_carteira
         score, score_emoji, score_desc = calcular_score(
             mc_t0, liq_t0, txns_5min, ratio_vol_mc_t0, idade_min, dex,
             holders_count=holders_count, top10_pct=top10_pct,
