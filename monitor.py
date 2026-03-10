@@ -384,20 +384,28 @@ def classificar_momentum(net, total):
 
 def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
                    holders_count=None, top10_pct=None, buys=0, sells=0,
-                   dev_classif=None, hora_utc=None):
+                   dev_classif=None, hora_utc=None, is_multi=False,
+                   bc_progress=None):
     """
-    Score v4 — calibrado com dados reais + histórico do deployer + hora do dia
-    Baseline: 20.6% WinRate (target +100%)
+    Score v5 — calibrado com 680 tokens finalizados
+    Baseline: 20.7% WinRate (target +100%)
     Max: 10 pontos (+ multiplicador de hora)
+
+    Novidades v5:
+    ✅ BC Progress incluído (<30% = bônus, 60-90% = penalidade)
+    ✅ Holders 200-500 reativado (+32% lift confirmado)
+    ✅ Multi-carteira monitorado (7.7% WR — ainda poucos dados)
+    ✅ MC sweet spot ajustado: $5-60k todos positivos, >$60k penaliza
+    ✅ Momentum 20-50 confirmado como critério válido
     """
     score = 0
 
     # ── BLOQUEIO IMEDIATO — serial rugger ─────────────────
-    # Dev com >= 80% de rug rate — não importa nada mais
     if dev_classif == "serial_rugger":
         return 0, "💀", "SERIAL RUGGER — BLOQUEADO"
 
     # ── Pressão compradora (0-3 pts) — critério mais forte ──
+    # lift: >=70% = +24%, 55-70% = +22%, <40% = -22%
     total_txns = (buys or 0) + (sells or 0)
     if total_txns > 0:
         ratio_bs = buys / total_txns
@@ -406,25 +414,49 @@ def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
         elif ratio_bs >= 0.40: score += 0
         else:                  score -= 2
 
-    # ── Ratio Vol/MC (0-2 pts) ────────────────────────────
-    if ratio_vol_mc is not None:
-        if 1.0 <= ratio_vol_mc < 3.0:  score += 2   # sweet spot +30%
-        elif ratio_vol_mc >= 3.0:       score += 1   # alto mas ok
-        elif ratio_vol_mc < 0.8:        score -= 1
-
     # ── Idade do token (0-2 pts) ──────────────────────────
+    # lift: 25-60min = +41%, <=10min = +16%, 10-25min = -38%
     if idade_min is not None:
-        if 25 <= idade_min <= 60:    score += 2   # lift +82%
-        elif idade_min <= 10:        score += 1   # lift +16%
-        elif 10 < idade_min < 25:    score -= 1   # pior faixa
-        elif idade_min > 120:        score -= 1
+        if 25 <= idade_min <= 60:  score += 2   # sweet spot confirmado
+        elif idade_min <= 10:      score += 1   # novo = bom
+        elif 10 < idade_min < 25:  score -= 2   # pior faixa — lift -38%
+        elif idade_min > 120:      score -= 1   # muito velho
 
     # ── MC entrada (0-2 pts) ──────────────────────────────
+    # lift: $30-60k = +13%, $5-30k = +7-8%, >$60k = -46%
+    # Ajuste: toda faixa $5-60k é positiva, sem sweet spot único
     if mc_t0:
-        if 15000 <= mc_t0 <= 30000:  score += 2   # lift +26%
-        elif 5000 <= mc_t0 < 15000:  score += 1   # lift +13%
-        elif mc_t0 > 60000:          score -= 2   # lift -50%
-        elif mc_t0 < 5000:           score -= 1
+        if 30000 <= mc_t0 <= 60000:  score += 2   # melhor faixa — lift +13%
+        elif 5000 <= mc_t0 < 30000:  score += 1   # bom — lift +7-8%
+        elif mc_t0 > 60000:          score -= 2   # armadilha — lift -46%
+        elif mc_t0 < 5000:           score -= 1   # muito barato
+
+    # ── Ratio Vol/MC (0-1 pt) ────────────────────────────
+    # lift: 1.0-1.5 = +17% — sinal moderado, vale 1pt apenas
+    if ratio_vol_mc is not None:
+        if 1.0 <= ratio_vol_mc < 3.0:  score += 1   # sweet spot
+        elif ratio_vol_mc < 0.8:        score -= 1   # fraco
+
+    # ── Momentum líquido (0-1 pt) ─────────────────────────
+    # Aproximado via buys-sells quando não temos net_momentum direto
+    # lift: 20-50 = +29%, >50 = +16%
+    if total_txns > 0:
+        net = (buys or 0) - (sells or 0)
+        if net >= 20:    score += 1   # compradores dominando
+        elif net < 0:    score -= 1   # vendedores dominando
+
+    # ── Holders (0-1 pt) — reativado com dados suficientes ──
+    # lift: 200-500 = +32%, >500 = +38% — sinal sólido
+    # lift: <80 = -15%, 80-200 = -11% — abaixo do esperado
+    if holders_count is not None:
+        if holders_count >= 200:       score += 1   # distribuição real
+        elif holders_count < 80:       score -= 1   # muito concentrado ainda
+
+    # ── BC Progress (0-1 pt) — novo critério ─────────────
+    # lift: <30% = +43%, 60-90% = -46%, >90% = +13%
+    if bc_progress is not None:
+        if bc_progress < 30:           score += 1   # cedo na bonding curve
+        elif 60 <= bc_progress < 90:   score -= 1   # zona de risco — quase migrando
 
     # ── Transações (0-1 pt) ───────────────────────────────
     if txns and txns >= 80:
@@ -434,26 +466,24 @@ def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
     if dex == "pumpfun":
         score += 1
 
-    # ── Histórico do deployer (bônus/penalidade) ──────────
-    if dev_classif == "confiavel":      score += 2   # dev com histórico limpo
-    elif dev_classif == "misto":        score += 0   # neutro
-    elif dev_classif == "rugger":       score -= 3   # penalidade forte
-    elif dev_classif == "novo":         score += 0   # sem histórico = neutro
-    # serial_rugger já foi bloqueado acima
+    # ── Histórico do deployer ─────────────────────────────
+    if dev_classif == "confiavel":  score += 2
+    elif dev_classif == "rugger":   score -= 3
+    # novo/misto = neutro, serial_rugger já bloqueado acima
 
     # ── Score base finalizado ─────────────────────────────
     score = max(0, min(10, score))
 
     # ── Multiplicador de hora UTC ─────────────────────────
-    # Baseado nos dados: 02-08h UTC melhor WR, 18-20h UTC pior
     if hora_utc is not None:
-        if 2 <= hora_utc < 8:
-            multiplicador = 1.15   # horário bom
-        elif 18 <= hora_utc < 20:
-            multiplicador = 0.85   # horário ruim
-        else:
-            multiplicador = 1.0
-        score = round(min(10, score * multiplicador))
+        if 2 <= hora_utc < 8:       mult = 1.15   # melhor horário
+        elif 18 <= hora_utc < 20:   mult = 0.85   # pior horário
+        else:                        mult = 1.0
+        score = round(min(10, score * mult))
+
+    # ── Nota de atenção: multi-carteira ──────────────────
+    # WR 7.7% com 13 tokens — sinal negativo mas amostra pequena
+    # Monitorar — não penalizar ainda
 
     if score >= 7:   return score, "🟢", "ALTA CONFIANÇA"
     elif score >= 4: return score, "🟡", "MODERADO"
@@ -1243,7 +1273,9 @@ def processar_tx(tx, carteira_addr, nome):
             holders_count=holders_count, top10_pct=top10_pct,
             buys=buys_5min, sells=sells_5min,
             dev_classif=dev_classif_score,
-            hora_utc=__import__("datetime").datetime.utcnow().hour
+            hora_utc=__import__("datetime").datetime.utcnow().hour,
+            is_multi=is_multi,
+            bc_progress=bc_progress
         )
 
         flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
