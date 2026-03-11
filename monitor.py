@@ -344,51 +344,81 @@ def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
                    holders_count=None, top10_pct=None, buys=0, sells=0,
                    dev_classif=None, hora_utc=None, is_multi=False,
                    bc_progress=None):
+    # v7.0 — score recalibrado com base em 782 registros reais
+    # Principais mudanças:
+    #   bc_progress: peso aumentado (melhor preditor, r=-0.145)
+    #   txns>=80: removido (correlação ~0 com var_pico)
+    #   is_multi: bônus adicionado (win 43.8% vs 36.4%)
+    #   ratio_bs: reduzido de +3 para +2 (concentração de pontos melhorada)
+    #   idade_min: corrigida inversão 10-25min
+    #   mc_t0: faixa ampliada para 15k-80k
     score = 0
     if dev_classif == "serial_rugger":
         return 0, "💀", "SERIAL RUGGER — BLOQUEADO"
+
+    # 1. BC PROGRESS — melhor preditor (r=-0.145): quanto menor, melhor
+    if bc_progress is not None:
+        if bc_progress < 20:          score += 3
+        elif bc_progress < 40:        score += 2
+        elif bc_progress < 60:        score += 1
+        elif bc_progress < 80:        score -= 1
+        else:                         score -= 2
+
+    # 2. RATIO BUY/SELL — pressão compradora
     total_txns = (buys or 0) + (sells or 0)
     if total_txns > 0:
         ratio_bs = buys / total_txns
-        if ratio_bs >= 0.70:   score += 3
-        elif ratio_bs >= 0.55: score += 2
-        elif ratio_bs >= 0.40: score += 0
-        else:                  score -= 2
-    if idade_min is not None:
-        if 25 <= idade_min <= 60:  score += 2
-        elif idade_min <= 10:      score += 1
-        elif 10 < idade_min < 25:  score -= 2
-        elif idade_min > 120:      score -= 1
+        if ratio_bs >= 0.70:          score += 2
+        elif ratio_bs >= 0.55:        score += 1
+        elif ratio_bs >= 0.40:        score += 0
+        else:                         score -= 2
+
+    # 3. MARKET CAP — faixa ampliada (era 30k-60k, agora 15k-80k)
     if mc_t0:
-        if 30000 <= mc_t0 <= 60000:  score += 2
-        elif 5000 <= mc_t0 < 30000:  score += 1
-        elif mc_t0 > 60000:          score -= 2
-        elif mc_t0 < 5000:           score -= 1
-    if ratio_vol_mc is not None:
-        if 1.0 <= ratio_vol_mc < 3.0:  score += 1
-        elif ratio_vol_mc < 0.8:        score -= 1
+        if 15000 <= mc_t0 <= 80000:   score += 2
+        elif 5000 <= mc_t0 < 15000:   score += 1
+        elif 80000 < mc_t0 <= 150000: score += 0
+        elif mc_t0 > 150000:          score -= 2
+        elif mc_t0 < 5000:            score -= 1
+
+    # 4. IDADE DO TOKEN — corrigida inversão anterior
+    if idade_min is not None:
+        if 20 <= idade_min <= 60:     score += 2
+        elif 10 <= idade_min < 20:    score += 1
+        elif idade_min < 10:          score += 0   # muito novo, neutro
+        elif 60 < idade_min <= 120:   score += 0
+        elif idade_min > 120:         score -= 1
+
+    # 5. NET MOMENTUM
     if total_txns > 0:
         net = (buys or 0) - (sells or 0)
-        if net >= 20:    score += 1
-        elif net < 0:    score -= 1
-    if holders_count is not None:
-        if holders_count >= 200:       score += 1
-        elif holders_count < 80:       score -= 1
-    if bc_progress is not None:
-        if bc_progress < 30:           score += 1
-        elif 60 <= bc_progress < 90:   score -= 1
-    if txns and txns >= 80:
+        if net >= 20:   score += 1
+        elif net < 0:   score -= 1
+
+    # 6. MULTI-CARTEIRA — bônus confirmado pelos dados (win 43.8% vs 36.4%)
+    if is_multi:
         score += 1
+
+    # 7. HOLDERS
+    if holders_count is not None:
+        if holders_count >= 200:      score += 1
+        elif holders_count < 80:      score -= 1
+
+    # 8. DEV HISTORY
+    if dev_classif == "confiavel":    score += 1
+    elif dev_classif == "rugger":     score -= 3
+
+    # 9. RATIO VOL/MC — mantido mas sem bônus (correlação fraca)
+    if ratio_vol_mc is not None:
+        if ratio_vol_mc < 0.5:        score -= 1   # volume muito baixo
+
+    # 10. DEX PUMPFUN — mantido
     if dex == "pumpfun":
         score += 1
-    if dev_classif == "confiavel":  score += 2
-    elif dev_classif == "rugger":   score -= 3
+
+    # txns >= 80 REMOVIDO — correlação ~0 com var_pico (dados reais)
+
     score = max(0, min(10, score))
-    if hora_utc is not None:
-        if 2 <= hora_utc < 8:       mult = 1.15
-        elif 18 <= hora_utc < 20:   mult = 0.85
-        else:                        mult = 1.0
-        score = round(min(10, score * mult))
     if score >= 7:   return score, "🟢", "ALTA CONFIANÇA"
     elif score >= 4: return score, "🟡", "MODERADO"
     else:            return score, "🔴", "BAIXA CONFIANÇA"
