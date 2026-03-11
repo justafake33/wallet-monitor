@@ -1481,7 +1481,7 @@ def rota_analise():
             return jsonify({"status": "sem dados", "msg": "Nenhum registro finalizado encontrado."})
         ts  = datetime.now().strftime("%d/%m/%Y %H:%M")
         msg = mod_analise.fmt_telegram(rows, ts)
-        mod_analise.telegram(msg)
+        telegram(msg)
         return jsonify({"status": "ok", "registros": len(rows), "msg": "Análise enviada ao Telegram."})
     except Exception as e:
         return jsonify({"status": "erro", "msg": str(e)}), 500
