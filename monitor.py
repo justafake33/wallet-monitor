@@ -1132,51 +1132,98 @@ def processar_tx(tx, carteira_addr, nome):
                 pass
         agendar_checkpoints(nome, mint)
 def verificar_calibracao():
-    """Roda diariamente — verifica se dados estão prontos para calibrar o score."""
+    """Roda diariamente — analisa performance real por tier e sugere ajustes no score."""
     try:
-        with get_conn() as conn:  # CORRIGIDO: era create_engine/DB_URL
+        with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT holders_count, top10_pct, dev_saiu, holders_t1, holders_t3,
-                           var_pico, data_compra, categoria_final
+                    SELECT score_qualidade, holders_count, top10_pct, dev_saiu,
+                           holders_t1, holders_t3, var_pico, categoria_final,
+                           mc_t0, liq_t0, ratio_vol_mc_t0, net_momentum_t0,
+                           idade_min, bc_progress
                     FROM registros
                     WHERE tipo = 'COMPRA'
                       AND categoria_final IS NOT NULL
                       AND categoria_final NOT ILIKE '%aguardando%'
+                      AND categoria_final NOT ILIKE '%sem dados%'
                       AND var_pico IS NOT NULL
                 """)
                 rows = cur.fetchall()
         total = len(rows)
-        MIN_TOTAL    = 800
-        MIN_CRITERIO = 30
-        cols = {
+        MIN_TOTAL = 200  # mínimo para análise útil
+
+        if total < MIN_TOTAL:
+            log(f"[calibração] 🔴 Faltam {MIN_TOTAL - total} tokens para análise (têm {total})")
+            threading.Timer(24 * 60 * 60, verificar_calibracao).start()
+            return
+
+        # ── Performance por tier ────────────────────────────────
+        def stats_tier(filtro):
+            vals = [r["var_pico"] for r in rows if filtro(r) and r["var_pico"] is not None]
+            if not vals: return None
+            venc = sum(1 for v in vals if v > 50)
+            mortes = sum(1 for v in vals if v < -50)
+            mediana = sorted(vals)[len(vals)//2]
+            return {"n": len(vals), "win_pct": round(venc/len(vals)*100,1),
+                    "morte_pct": round(mortes/len(vals)*100,1), "mediana": round(mediana,1)}
+
+        alta    = stats_tier(lambda r: (r.get("score_qualidade") or 0) >= 7)
+        mod     = stats_tier(lambda r: 4 <= (r.get("score_qualidade") or 0) < 7)
+        baixa   = stats_tier(lambda r: (r.get("score_qualidade") or 0) < 4)
+        geral   = stats_tier(lambda r: True)
+
+        # ── Detecta problemas e sugere ajustes ─────────────────
+        avisos = []
+        if alta and mod:
+            diff = alta["win_pct"] - mod["win_pct"]
+            if diff < 5:
+                avisos.append(f"⚠️ ALTA e MODERADO têm win rates parecidos ({alta['win_pct']}% vs {mod['win_pct']}%) — corte em 7 pode estar alto demais")
+            elif diff > 25:
+                avisos.append(f"✅ Separação excelente ALTA vs MOD: +{diff:.1f}% win rate")
+        if mod and baixa:
+            diff = mod["win_pct"] - baixa["win_pct"]
+            if diff < 5:
+                avisos.append(f"⚠️ MODERADO e BAIXA têm win rates parecidos ({mod['win_pct']}% vs {baixa['win_pct']}%) — corte em 4 pode estar baixo demais")
+        if alta and alta["win_pct"] < 40:
+            avisos.append(f"🚨 ALTA CONFIANÇA com win rate {alta['win_pct']}% — score não está filtrando bem")
+
+        # ── Verifica completude das colunas novas ───────────────
+        cols_novas = {
             "holders_count": "holders T0",
             "top10_pct":     "top10 T0",
             "holders_t1":    "holders T1",
             "holders_t3":    "holders T3",
             "dev_saiu":      "dev_saiu",
         }
-        novos_prontos = []
-        for col, nome_col in cols.items():
-            count = sum(1 for r in rows if r.get(col) is not None)
-            if count >= MIN_CRITERIO:
-                novos_prontos.append(nome_col)
-        log(f"[calibração] {total} tokens | critérios novos prontos: {len(novos_prontos)}")
-        if total >= MIN_TOTAL and len(novos_prontos) >= 3:
-            msg = (
-                f"🧠 <b>CALIBRAÇÃO DO SCORE DISPONÍVEL</b>\n\n"
-                f"Os dados já permitem recalibrar o score com novos critérios.\n\n"
-                f"📊 <b>{total}</b> tokens finalizados\n"
-                f"✅ Critérios novos prontos: <b>{len(novos_prontos)}</b>\n"
-                + "".join([f"\n  • {c}" for c in novos_prontos]) +
-                f"\n\n📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-            )
-            telegram(msg)
-            log("[calibração] ✅ Alerta enviado no Telegram!")
-        elif total >= MIN_TOTAL:
-            log(f"[calibração] 🟡 Tokens suficientes mas critérios novos insuficientes ({len(novos_prontos)}/3)")
-        else:
-            log(f"[calibração] 🔴 Faltam {MIN_TOTAL - total} tokens para o mínimo")
+        prontos = [nome for col, nome in cols_novas.items()
+                   if sum(1 for r in rows if r.get(col) is not None) >= 30]
+
+        # ── Monta e envia relatório ─────────────────────────────
+        def fmt(s):
+            if not s: return "—"
+            return f"n={s['n']} | win={s['win_pct']}% | morte={s['morte_pct']}% | med={s['mediana']}%"
+
+        linhas = [
+            f"🧠 <b>CALIBRAÇÃO DIÁRIA — {datetime.now().strftime('%d/%m %H:%M')}</b>",
+            f"📊 {total} tokens finalizados\n",
+            f"<b>Performance por tier:</b>",
+            f"🟢 ALTA    {fmt(alta)}",
+            f"🟡 MOD     {fmt(mod)}",
+            f"🔴 BAIXA   {fmt(baixa)}",
+            f"⚪ GERAL   {fmt(geral)}",
+        ]
+        if avisos:
+            linhas.append(f"\n<b>Diagnóstico:</b>")
+            linhas += avisos
+        if prontos:
+            linhas.append(f"\n<b>Critérios com dados suficientes:</b>")
+            linhas += [f"  ✅ {p}" for p in prontos]
+        if total >= 800 and len(prontos) >= 3:
+            linhas.append(f"\n🚀 <b>Dados prontos para recalibrar pesos do ML!</b>")
+
+        msg = "\n".join(linhas)
+        telegram(msg)
+        log(f"[calibração] ✅ Relatório enviado | {total} tokens | ALTA={alta['win_pct'] if alta else '—'}% win")
     except Exception as e:
         log(f"[calibração] erro: {e}")
     threading.Timer(24 * 60 * 60, verificar_calibracao).start()
