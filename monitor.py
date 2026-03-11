@@ -1470,6 +1470,22 @@ def dados():
         "alertas_multi":   multis,
         "historico":       [r for r in todos_sorted if r.get("categoria_final") and "aguardando" not in r.get("categoria_final", "")][:200],
     })
+@app.route("/analise", methods=["GET"])
+def rota_analise():
+    if request.args.get("key") != DASHBOARD_KEY:
+        return jsonify({"erro": "nao autorizado"}), 401
+    try:
+        import analise as mod_analise
+        rows = mod_analise.buscar_registros()
+        if not rows:
+            return jsonify({"status": "sem dados", "msg": "Nenhum registro finalizado encontrado."})
+        ts  = datetime.now().strftime("%d/%m/%Y %H:%M")
+        msg = mod_analise.fmt_telegram(rows, ts)
+        mod_analise.telegram(msg)
+        return jsonify({"status": "ok", "registros": len(rows), "msg": "Análise enviada ao Telegram."})
+    except Exception as e:
+        return jsonify({"status": "erro", "msg": str(e)}), 500
+
 # ══════════════════════════════════════════════════════════
 # STARTUP
 # ══════════════════════════════════════════════════════════
