@@ -174,41 +174,62 @@ def analise_score_vs_resultado(rows):
         })
     return resultado
 
-def analise_correlacao_features(rows):
-    """
-    Correlação simples de Pearson entre cada feature e var_pico.
-    Retorna lista ordenada por |correlação|.
-    """
-    features = [
-        "score_qualidade", "mc_t0", "liq_t0", "volume_t0",
-        "txns5m_t0", "buys_t0", "sells_t0", "net_momentum_t0",
-        "idade_min", "ratio_vol_mc_t0", "holders_count",
-        "top1_pct", "top10_pct", "bc_progress",
-    ]
+FEATURES = [
+    "score_qualidade", "mc_t0", "liq_t0", "volume_t0",
+    "txns5m_t0", "buys_t0", "sells_t0", "net_momentum_t0",
+    "idade_min", "ratio_vol_mc_t0", "holders_count",
+    "top1_pct", "top10_pct", "bc_progress",
+]
 
-    def pearson(xs, ys):
-        n = len(xs)
-        if n < 3: return None
-        mx, my = sum(xs)/n, sum(ys)/n
-        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-        dx  = sum((x - mx) ** 2 for x in xs) ** 0.5
-        dy  = sum((y - my) ** 2 for y in ys) ** 0.5
-        if dx == 0 or dy == 0: return None
-        return round(num / (dx * dy), 3)
+TARGETS = ["var_pico", "var_t1", "var_t2", "var_t3"]
 
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 3: return None
+    mx, my = sum(xs)/n, sum(ys)/n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx  = sum((x - mx) ** 2 for x in xs) ** 0.5
+    dy  = sum((y - my) ** 2 for y in ys) ** 0.5
+    if dx == 0 or dy == 0: return None
+    return round(num / (dx * dy), 3)
+
+def analise_correlacao_features(rows, target="var_pico"):
+    """Correlação de Pearson entre cada feature e um target. Ordenado por |r|."""
     resultado = []
-    y_all = [r["var_pico"] for r in rows]
-    for feat in features:
-        pares = [(r[feat], r["var_pico"]) for r in rows
-                 if r.get(feat) is not None and r["var_pico"] is not None]
+    for feat in FEATURES:
+        pares = [(r[feat], r[target]) for r in rows
+                 if r.get(feat) is not None and r.get(target) is not None]
         if len(pares) < 10:
             resultado.append({"feature": feat, "correlacao": None, "n": len(pares)})
             continue
         xs, ys = zip(*pares)
-        r_val = pearson(list(xs), list(ys))
-        resultado.append({"feature": feat, "correlacao": r_val, "n": len(pares)})
-
+        resultado.append({"feature": feat, "correlacao": _pearson(list(xs), list(ys)), "n": len(pares)})
     return sorted(resultado, key=lambda x: abs(x["correlacao"] or 0), reverse=True)
+
+def analise_correlacao_multi_targets(rows):
+    """
+    Tabela comparativa: para cada feature, mostra r contra var_pico, var_t1, var_t2, var_t3.
+    Ordenado pelo maior |r| médio entre os targets com dados suficientes.
+    """
+    resultado = []
+    for feat in FEATURES:
+        entry = {"feature": feat, "targets": {}}
+        rs = []
+        for target in TARGETS:
+            pares = [(r[feat], r[target]) for r in rows
+                     if r.get(feat) is not None and r.get(target) is not None]
+            n = len(pares)
+            if n < 10:
+                entry["targets"][target] = {"r": None, "n": n}
+            else:
+                xs, ys = zip(*pares)
+                r_val = _pearson(list(xs), list(ys))
+                entry["targets"][target] = {"r": r_val, "n": n}
+                if r_val is not None:
+                    rs.append(abs(r_val))
+        entry["max_abs_r"] = max(rs) if rs else 0
+        resultado.append(entry)
+    return sorted(resultado, key=lambda x: x["max_abs_r"], reverse=True)
 
 # ──────────────────────────────────────────────────────────
 # FORMATAÇÃO TERMINAL
@@ -276,25 +297,24 @@ def fmt_terminal(rows, ts):
         bar = barra(cnt, total, 15)
         linhas.append(f"  {bar}  {pct(cnt, total):>6}  {cnt:>4}×  {cat}")
 
-    # 6. Correlação features
-    linhas.append(f"\n{'─'*60}")
-    linhas.append("  CORRELAÇÃO DAS FEATURES COM var_pico")
-    linhas.append(f"{'─'*60}")
-    linhas.append(f"  {'Feature':<22} {'r':>7}  {'n':>5}  Força")
-    linhas.append(f"  {'─'*22} {'─'*7}  {'─'*5}  {'─'*15}")
-    for f in analise_correlacao_features(rows):
-        r = f["correlacao"]
-        if r is None:
-            forca = "insuficiente"
-            r_str = "  —   "
-        else:
-            r_str = f"{r:>+.3f}"
-            fa = abs(r)
-            if   fa >= 0.3: forca = "🔥 FORTE"
-            elif fa >= 0.15: forca = "⚡ MODERADA"
-            elif fa >= 0.05: forca = "💧 FRACA"
-            else:            forca = "  irrelevante"
-        linhas.append(f"  {f['feature']:<22} {r_str}  {f['n']:>5}  {forca}")
+    # 6. Correlação features (multi-target)
+    linhas.append(f"\n{'─'*72}")
+    linhas.append("  CORRELAÇÃO DAS FEATURES (r de Pearson por target)")
+    linhas.append(f"{'─'*72}")
+    linhas.append(f"  {'Feature':<22}  {'var_pico':>10}  {'var_t1':>10}  {'var_t2':>10}  {'var_t3':>10}")
+    linhas.append(f"  {'─'*22}  {'─'*10}  {'─'*10}  {'─'*10}  {'─'*10}")
+
+    def _fmt_r(entry, target):
+        t = entry["targets"][target]
+        if t["r"] is None:
+            return f"{'—':>7}({t['n']:>3})"
+        fa = abs(t["r"])
+        star = "🔥" if fa >= 0.3 else ("⚡" if fa >= 0.15 else ("💧" if fa >= 0.05 else "  "))
+        return f"{t['r']:>+.3f}({t['n']:>3}){star}"
+
+    for f in analise_correlacao_multi_targets(rows):
+        cols = "  ".join(_fmt_r(f, tgt) for tgt in TARGETS)
+        linhas.append(f"  {f['feature']:<22}  {cols}")
 
     linhas.append(f"\n{'═'*60}\n")
     return "\n".join(linhas)
@@ -306,7 +326,6 @@ def fmt_telegram(rows, ts):
     total = len(rows)
     tiers = analise_por_tier(rows)
     multi = analise_multi_vs_single(rows)
-    corr  = analise_correlacao_features(rows)
 
     msg = f"📊 <b>DASHBOARD DE PERFORMANCE</b>\n"
     msg += f"<i>{ts} — {total} registros</i>\n\n"
@@ -319,11 +338,16 @@ def fmt_telegram(rows, ts):
     for m in multi:
         msg += f"• {m['label']}: n={m['total']} | win={m['win_rate']} | med={m['mediana'] or '—'}%\n"
 
-    msg += "\n<b>Top features correlacionadas</b>\n"
-    for f in corr[:5]:
-        r = f["correlacao"]
-        if r is not None:
-            msg += f"• {f['feature']}: r={r:+.3f} (n={f['n']})\n"
+    multi_corr = analise_correlacao_multi_targets(rows)
+    msg += "\n<b>Top features (melhor r em qualquer target)</b>\n"
+    for f in multi_corr[:5]:
+        parts = []
+        for tgt in TARGETS:
+            t = f["targets"][tgt]
+            if t["r"] is not None:
+                parts.append(f"{tgt}:{t['r']:+.3f}(n={t['n']})")
+        if parts:
+            msg += f"• {f['feature']}: {' | '.join(parts)}\n"
 
     return msg
 
@@ -345,7 +369,6 @@ def fmt_html(rows, ts):
     multi = analise_multi_vs_single(rows)
     cats = analise_categorias(rows)
     scores = analise_score_vs_resultado(rows)
-    corr = analise_correlacao_features(rows)
 
     def tabela(cabecalho, dados):
         cols = list(cabecalho)
@@ -403,9 +426,28 @@ def fmt_html(rows, ts):
     cat_rows = [{"categoria": c, "n": n, "pct": pct(n, total)} for c, n in cats]
     html += tabela({"categoria":"Categoria","n":"N","pct":"%"}, cat_rows)
 
-    html += "<h2>Correlação com var_pico</h2>\n"
-    corr_rows = [{"feature": f["feature"], "r": f"{f['correlacao']:+.3f}" if f["correlacao"] else "—", "n": f["n"]} for f in corr]
-    html += tabela({"feature":"Feature","r":"Correlação r","n":"N"}, corr_rows)
+    html += "<h2>Correlação das Features por Target</h2>\n"
+    multi_corr = analise_correlacao_multi_targets(rows)
+
+    def _fmt_cell(entry, target):
+        t = entry["targets"][target]
+        if t["r"] is None:
+            return f"— (n={t['n']})"
+        fa = abs(t["r"])
+        star = " 🔥" if fa >= 0.3 else (" ⚡" if fa >= 0.15 else (" 💧" if fa >= 0.05 else ""))
+        return f"{t['r']:+.3f} (n={t['n']}){star}"
+
+    corr_rows = [
+        {
+            "feature":   f["feature"],
+            "var_pico":  _fmt_cell(f, "var_pico"),
+            "var_t1":    _fmt_cell(f, "var_t1"),
+            "var_t2":    _fmt_cell(f, "var_t2"),
+            "var_t3":    _fmt_cell(f, "var_t3"),
+        }
+        for f in multi_corr
+    ]
+    html += tabela({"feature":"Feature","var_pico":"var_pico","var_t1":"var_t1","var_t2":"var_t2","var_t3":"var_t3"}, corr_rows)
 
     html += "</body></html>"
     return html
