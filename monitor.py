@@ -1140,7 +1140,7 @@ def verificar_calibracao():
                     SELECT score_qualidade, holders_count, top10_pct, dev_saiu,
                            holders_t1, holders_t3, var_pico, categoria_final,
                            mc_t0, liq_t0, ratio_vol_mc_t0, net_momentum_t0,
-                           idade_min, bc_progress
+                           idade_min, bc_progress, buys_t0, sells_t0, txns5m_t0
                     FROM registros
                     WHERE tipo = 'COMPRA'
                       AND categoria_final IS NOT NULL
@@ -1150,12 +1150,14 @@ def verificar_calibracao():
                 """)
                 rows = cur.fetchall()
         total = len(rows)
-        MIN_TOTAL = 200  # mínimo para análise útil
+        MIN_TOTAL = 30  # mínimo para análise (resultado confiável a partir de 200)
 
         if total < MIN_TOTAL:
             log(f"[calibração] 🔴 Faltam {MIN_TOTAL - total} tokens para análise (têm {total})")
             threading.Timer(24 * 60 * 60, verificar_calibracao).start()
             return
+
+        aviso_amostra = f"⚠️ Amostra pequena ({total} tokens) — resultados preliminares" if total < 200 else ""
 
         # ── Performance por tier ────────────────────────────────
         def stats_tier(filtro):
@@ -1172,20 +1174,107 @@ def verificar_calibracao():
         baixa   = stats_tier(lambda r: (r.get("score_qualidade") or 0) < 4)
         geral   = stats_tier(lambda r: True)
 
-        # ── Detecta problemas e sugere ajustes ─────────────────
-        avisos = []
+        # ── Detecta problemas nos cortes dos tiers ──────────────
+        avisos_tier = []
         if alta and mod:
             diff = alta["win_pct"] - mod["win_pct"]
             if diff < 5:
-                avisos.append(f"⚠️ ALTA e MODERADO têm win rates parecidos ({alta['win_pct']}% vs {mod['win_pct']}%) — corte em 7 pode estar alto demais")
+                avisos_tier.append(f"⚠️ ALTA e MODERADO parecidos ({alta['win_pct']}% vs {mod['win_pct']}%) — corte em 7 alto demais")
             elif diff > 25:
-                avisos.append(f"✅ Separação excelente ALTA vs MOD: +{diff:.1f}% win rate")
+                avisos_tier.append(f"✅ Separação ALTA vs MOD: +{diff:.1f}% win rate")
         if mod and baixa:
             diff = mod["win_pct"] - baixa["win_pct"]
             if diff < 5:
-                avisos.append(f"⚠️ MODERADO e BAIXA têm win rates parecidos ({mod['win_pct']}% vs {baixa['win_pct']}%) — corte em 4 pode estar baixo demais")
+                avisos_tier.append(f"⚠️ MODERADO e BAIXA parecidos ({mod['win_pct']}% vs {baixa['win_pct']}%) — corte em 4 baixo demais")
         if alta and alta["win_pct"] < 40:
-            avisos.append(f"🚨 ALTA CONFIANÇA com win rate {alta['win_pct']}% — score não está filtrando bem")
+            avisos_tier.append(f"🚨 ALTA CONFIANÇA com win rate {alta['win_pct']}% — score não filtra bem")
+
+        # ── Análise por critério (discriminação) ────────────────
+        def win_pct(subset):
+            if not subset: return None
+            return round(sum(1 for r in subset if (r["var_pico"] or 0) > 50) / len(subset) * 100, 1)
+
+        def disc(label, bons, ruins, bonus, penalidade):
+            """Compara win rate bons vs ruins para um critério. Sugere ajuste se discriminação fraca."""
+            wr_bom  = win_pct(bons)
+            wr_ruim = win_pct(ruins)
+            if wr_bom is None or wr_ruim is None or len(bons) < 5 or len(ruins) < 5:
+                return None
+            delta = wr_bom - wr_ruim
+            if delta < 5 and bonus >= 2:
+                nota = f"⚠️ {label}: +{bonus}pts mas Δwin={delta:+.1f}% → reduza para +{bonus - 1}"
+            elif delta < 5 and penalidade <= -2:
+                nota = f"⚠️ {label}: {penalidade}pts mas Δwin={delta:+.1f}% → reduza para {penalidade + 1}"
+            elif delta < 0 and bonus > 0:
+                nota = f"🚨 {label}: critério INVERTIDO — bons={wr_bom}% vs ruins={wr_ruim}% → remova bônus"
+            elif delta < 0 and penalidade < 0:
+                nota = f"🚨 {label}: penalidade INVERTIDA — bons={wr_bom}% vs ruins={wr_ruim}% → remova penalidade"
+            elif delta >= 20:
+                nota = f"✅ {label}: forte discriminador Δ={delta:+.1f}% — peso ok"
+            else:
+                nota = None  # discriminação ok, sem sugestão
+            return {"label": label, "delta": delta, "wr_bom": wr_bom, "n_bom": len(bons),
+                    "wr_ruim": wr_ruim, "n_ruim": len(ruins), "nota": nota}
+
+        criterios = []
+
+        # ratio buys/sells
+        rows_bs = [r for r in rows if (r.get("buys_t0") or 0) + (r.get("sells_t0") or 0) > 0]
+        if rows_bs:
+            bons  = [r for r in rows_bs if r["buys_t0"] / (r["buys_t0"] + r["sells_t0"]) >= 0.70]
+            ruins = [r for r in rows_bs if r["buys_t0"] / (r["buys_t0"] + r["sells_t0"]) < 0.40]
+            d = disc("ratio_bs≥70% (+3) vs <40% (-2)", bons, ruins, 3, -2)
+            if d: criterios.append(d)
+
+        # mc_t0
+        rows_mc = [r for r in rows if r.get("mc_t0")]
+        if rows_mc:
+            bons  = [r for r in rows_mc if 30000 <= r["mc_t0"] <= 60000]
+            ruins = [r for r in rows_mc if r["mc_t0"] > 60000]
+            d = disc("mc_t0 30k-60k (+2) vs >60k (-2)", bons, ruins, 2, -2)
+            if d: criterios.append(d)
+
+        # idade_min
+        rows_id = [r for r in rows if r.get("idade_min") is not None]
+        if rows_id:
+            bons  = [r for r in rows_id if 25 <= r["idade_min"] <= 60]
+            ruins = [r for r in rows_id if 10 < r["idade_min"] < 25]
+            d = disc("idade 25-60min (+2) vs 10-25min (-2)", bons, ruins, 2, -2)
+            if d: criterios.append(d)
+
+        # holders_count
+        rows_h = [r for r in rows if r.get("holders_count") is not None]
+        if rows_h:
+            bons  = [r for r in rows_h if r["holders_count"] >= 200]
+            ruins = [r for r in rows_h if r["holders_count"] < 80]
+            d = disc("holders≥200 (+1) vs <80 (-1)", bons, ruins, 1, -1)
+            if d: criterios.append(d)
+
+        # bc_progress
+        rows_bc = [r for r in rows if r.get("bc_progress") is not None]
+        if rows_bc:
+            bons  = [r for r in rows_bc if r["bc_progress"] < 30]
+            ruins = [r for r in rows_bc if r["bc_progress"] >= 60]
+            d = disc("bc_progress<30% (+1) vs ≥60% (-1)", bons, ruins, 1, -1)
+            if d: criterios.append(d)
+
+        # ratio_vol_mc
+        rows_rv = [r for r in rows if r.get("ratio_vol_mc_t0") is not None]
+        if rows_rv:
+            bons  = [r for r in rows_rv if 1.0 <= r["ratio_vol_mc_t0"] < 3.0]
+            ruins = [r for r in rows_rv if r["ratio_vol_mc_t0"] < 0.8]
+            d = disc("ratio_vol_mc 1-3x (+1) vs <0.8x (-1)", bons, ruins, 1, -1)
+            if d: criterios.append(d)
+
+        # txns5m_t0
+        rows_tx = [r for r in rows if r.get("txns5m_t0") is not None]
+        if rows_tx:
+            bons  = [r for r in rows_tx if r["txns5m_t0"] >= 80]
+            ruins = [r for r in rows_tx if r["txns5m_t0"] < 30]
+            d = disc("txns5m≥80 (+1) vs <30 (0)", bons, ruins, 1, 0)
+            if d: criterios.append(d)
+
+        sugestoes = [c["nota"] for c in criterios if c.get("nota")]
 
         # ── Verifica completude das colunas novas ───────────────
         cols_novas = {
@@ -1206,24 +1295,43 @@ def verificar_calibracao():
         linhas = [
             f"🧠 <b>CALIBRAÇÃO DIÁRIA — {datetime.now().strftime('%d/%m %H:%M')}</b>",
             f"📊 {total} tokens finalizados\n",
+        ]
+        if aviso_amostra:
+            linhas.append(aviso_amostra + "\n")
+
+        linhas += [
             f"<b>Performance por tier:</b>",
             f"🟢 ALTA    {fmt(alta)}",
             f"🟡 MOD     {fmt(mod)}",
             f"🔴 BAIXA   {fmt(baixa)}",
             f"⚪ GERAL   {fmt(geral)}",
         ]
-        if avisos:
-            linhas.append(f"\n<b>Diagnóstico:</b>")
-            linhas += avisos
+        if avisos_tier:
+            linhas.append(f"\n<b>Diagnóstico dos tiers:</b>")
+            linhas += avisos_tier
+
+        if criterios:
+            linhas.append(f"\n<b>Discriminação por critério:</b>")
+            for c in criterios:
+                delta_str = f"{c['delta']:+.1f}%"
+                linhas.append(
+                    f"  • {c['label']}: bons={c['wr_bom']}%(n={c['n_bom']}) "
+                    f"ruins={c['wr_ruim']}%(n={c['n_ruim']}) Δ={delta_str}"
+                )
+
+        if sugestoes:
+            linhas.append(f"\n<b>Sugestões de ajuste:</b>")
+            linhas += sugestoes
+
         if prontos:
-            linhas.append(f"\n<b>Critérios com dados suficientes:</b>")
+            linhas.append(f"\n<b>Colunas com dados suficientes (≥30):</b>")
             linhas += [f"  ✅ {p}" for p in prontos]
         if total >= 800 and len(prontos) >= 3:
-            linhas.append(f"\n🚀 <b>Dados prontos para recalibrar pesos do ML!</b>")
+            linhas.append(f"\n🚀 <b>Dados prontos para ML!</b>")
 
         msg = "\n".join(linhas)
         telegram(msg)
-        log(f"[calibração] ✅ Relatório enviado | {total} tokens | ALTA={alta['win_pct'] if alta else '—'}% win")
+        log(f"[calibração] ✅ Relatório enviado | {total} tokens | ALTA={alta['win_pct'] if alta else '—'}% win | {len(sugestoes)} sugestões")
     except Exception as e:
         log(f"[calibração] erro: {e}")
     threading.Timer(24 * 60 * 60, verificar_calibracao).start()
