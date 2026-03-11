@@ -4,6 +4,7 @@ import time
 import threading
 import os
 import json
+import html as html_lib
 import psycopg2
 import psycopg2.extras
 from datetime import datetime
@@ -294,6 +295,9 @@ def db_sig_add(sig):
             conn.commit()
     except:
         pass
+def he(s):
+    """Escapa caracteres HTML especiais em strings fornecidas por APIs externas."""
+    return html_lib.escape(str(s)) if s else ""
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 def telegram(msg):
@@ -779,7 +783,7 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
     icone = "👤" if TIPO_CARTEIRA.get(carteira_atual) == "humano" else "🤖"
     telegram(
         f"{urgencia}\n\n"
-        f"Token: <b>{nome_token}</b>\n"
+        f"Token: <b>{he(nome_token)}</b>\n"
         f"Mint: <code>{mint}</code>\n\n"
         f"{icone} <b>{carteira_atual}</b> comprou agora\n"
         + "\n".join(linhas) + "\n\n"
@@ -787,7 +791,7 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
         f"💰 MC: <b>${mc_t0:,.0f}</b>\n"
         f"💧 Liq: <b>${liq_t0:,.0f}</b>\n"
         f"📊 Vol/MC: <b>{ratio_vol_mc:.1f}x</b>\n"
-        f"🕐 Idade: <b>{idade_min:.0f} min</b>"
+        f"🕐 Idade: <b>{idade_min:.0f} min</b>\n"
         f"{holder_linha}"
         f"{momentum_linha}\n\n"
         f"Score: {score_emoji} <b>{score}/10 — {score_desc}</b>\n\n"
@@ -915,9 +919,9 @@ def checar_checkpoint(nome, mint, checkpoint):
         log(f"  ⏱️  [{nome}] T1 {reg['nome'][:20]} | MC: ${mc:,.0f} | {veredito}")
         if reg.get("is_multi") and var_t1:
             if var_t1 >= 100:
-                telegram(f"🚨 <b>SAÍDA — T1 EXPLOSIVO</b>\n\nToken: <b>{reg['nome']}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n⚠️ <i>Considere realizar lucro.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
+                telegram(f"🚨 <b>SAÍDA — T1 EXPLOSIVO</b>\n\nToken: <b>{he(reg['nome'])}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n⚠️ <i>Considere realizar lucro.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
             elif var_t1 >= 50:
-                telegram(f"⚠️ <b>SAÍDA — T1 FORTE</b>\n\nToken: <b>{reg['nome']}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n💡 <i>Considere realizar parte.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
+                telegram(f"⚠️ <b>SAÍDA — T1 FORTE</b>\n\nToken: <b>{he(reg['nome'])}</b>\n📈 T1: <b>+{var_t1:.0f}%</b> em 5min\n💰 MC: <b>${mc:,.0f}</b>\n\n💡 <i>Considere realizar parte.</i>\n\n🔗 https://pump.fun/{reg['token_mint']}")
     elif checkpoint == "t2":
         var_t2 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
         veredito = veredito_parcial(reg.get("mc_t1"), mc, "15min")
