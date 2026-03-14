@@ -994,7 +994,7 @@ def checar_checkpoint(nome, mint, checkpoint, _retry=0):
         veredito = veredito_parcial(reg["mc_t0"], mc, "5min")
         mc_pico = max(mc, reg.get("mc_pico") or 0)
         h_t1 = top1_t1 = top10_t1 = dev_saiu_t1 = None
-        if mc and mc >= 10000:
+        if mc:
             dev_w = reg.get("dev_wallet")
             h_t1, top1_t1, top10_t1, dev_saiu_t1, _ = get_holder_data(mint, liq_t0=liq, dev_wallet=dev_w)
             log(f"  [T1 holders] {h_t1} top1={top1_t1} top10={top10_t1} dev_saiu={dev_saiu_t1}")
@@ -1020,7 +1020,7 @@ def checar_checkpoint(nome, mint, checkpoint, _retry=0):
         veredito = veredito_parcial(reg.get("mc_t1"), mc, "15min")
         mc_pico = max(mc, reg.get("mc_pico") or 0)
         h_t2 = top1_t2 = top10_t2 = dev_saiu_t2 = None
-        if mc and mc >= 10000:
+        if mc:
             dev_w = reg.get("dev_wallet")
             h_t2, top1_t2, top10_t2, dev_saiu_t2, _ = get_holder_data(mint, liq_t0=liq, dev_wallet=dev_w)
             log(f"  [T2 holders] {h_t2} top1={top1_t2} top10={top10_t2} dev_saiu={dev_saiu_t2}")
@@ -1043,7 +1043,7 @@ def checar_checkpoint(nome, mint, checkpoint, _retry=0):
         var_pico = round((mc_pico - reg["mc_t0"]) / reg["mc_t0"] * 100, 2) if reg.get("mc_t0") else None
         cat = categoria_final({**reg, "mc_t3": mc})
         h_t3 = top1_t3 = top10_t3 = dev_saiu_t3 = None
-        if mc and mc >= 10000:
+        if mc:
             dev_w = reg.get("dev_wallet")
             h_t3, top1_t3, top10_t3, dev_saiu_t3, _ = get_holder_data(mint, liq_t0=liq, dev_wallet=dev_w)
             log(f"  [T3 holders] {h_t3} top1={top1_t3} top10={top10_t3} dev_saiu={dev_saiu_t3}")
@@ -1093,22 +1093,17 @@ def processar_tx(tx, carteira_addr, nome):
         token_antigo    = "sim" if (idade_min and idade_min > 1440) else "não"
         holders_count = top1_pct = top10_pct = dev_saiu = bc_progress = None
         try:
-            if mc_t0 and mc_t0 >= 10000:
-                dev_wallet = get_dev_wallet(mint)
-                holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0, dev_wallet=dev_wallet)
-                dev_tokens_total, dev_tokens_rug, dev_rug_rate, dev_classif = get_deployer_history(dev_wallet)
-                for n in estado:
-                    for r in estado[n]["registros"]:
-                        if r.get("token_mint") == mint and r.get("tipo") == "COMPRA":
-                            r["dev_wallet"]       = dev_wallet
-                            r["dev_classif"]      = dev_classif
-                            r["dev_rug_rate"]     = dev_rug_rate
-                            r["dev_tokens_total"] = dev_tokens_total
-                            break
-            else:
-                if liq_t0 and liq_t0 > 0:
-                    TARGET_LIQ_USD = 11050
-                    bc_progress = min(round(liq_t0 / TARGET_LIQ_USD * 100, 1), 99.0)
+            dev_wallet = get_dev_wallet(mint)
+            holders_count, top1_pct, top10_pct, dev_saiu, bc_progress = get_holder_data(mint, liq_t0=liq_t0, dev_wallet=dev_wallet)
+            dev_tokens_total, dev_tokens_rug, dev_rug_rate, dev_classif = get_deployer_history(dev_wallet)
+            for n in estado:
+                for r in estado[n]["registros"]:
+                    if r.get("token_mint") == mint and r.get("tipo") == "COMPRA":
+                        r["dev_wallet"]       = dev_wallet
+                        r["dev_classif"]      = dev_classif
+                        r["dev_rug_rate"]     = dev_rug_rate
+                        r["dev_tokens_total"] = dev_tokens_total
+                        break
         except Exception as e:
             log(f"holders erro [{nome_token}]: {e}")
         dev_classif_score = None
