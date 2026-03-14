@@ -396,80 +396,82 @@ def classificar_momentum(net, total):
 def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
                    holders_count=None, top10_pct=None, buys=0, sells=0,
                    dev_classif=None, hora_utc=None, is_multi=False,
-                   bc_progress=None):
-    # v7.0 — score recalibrado com base em 782 registros reais
-    # Principais mudanças:
-    #   bc_progress: peso aumentado (melhor preditor, r=-0.145)
-    #   txns>=80: removido (correlação ~0 com var_pico)
-    #   is_multi: bônus adicionado (win 43.8% vs 36.4%)
-    #   ratio_bs: reduzido de +3 para +2 (concentração de pontos melhorada)
-    #   idade_min: corrigida inversão 10-25min
-    #   mc_t0: faixa ampliada para 15k-80k
+                   bc_progress=None, top1_pct=None, carteira=None):
+    # v8.0 — score recalibrado com base em 1004 registros reais (14/03/2026)
+    # Mudanças vs v7:
+    #   mc_t0: faixa ideal corrigida para 5k-15k (+3), 30-60k deixou de ser sweet spot
+    #   idade_min: janela 45-60min separada (+3, win 83.3%)
+    #   bc_progress: INVERTIDO — 40-80 é o melhor (não <30)
+    #   ratio_bs: gradiente ajustado, ≥65% = +2
+    #   top1_pct: adicionado — >50% penaliza (-2)
+    #   carteira: bônus para carteira_C (+2) e carteira_D (+1)
+    #   is_multi, is_pumpfun, hora_utc: removidos (importância ~0)
+    #   dev_classif: confiavel mantido em +2
     score = 0
     if dev_classif == "serial_rugger":
         return 0, "💀", "SERIAL RUGGER — BLOQUEADO"
 
-    # 1. BC PROGRESS — melhor preditor (r=-0.145): quanto menor, melhor
-    if bc_progress is not None:
-        if bc_progress < 20:          score += 3
-        elif bc_progress < 40:        score += 2
-        elif bc_progress < 60:        score += 1
-        elif bc_progress < 80:        score -= 1
-        else:                         score -= 2
+    # 1. MARKET CAP — faixa ideal corrigida (dados: 5k-15k = 45.9% win, melhor faixa)
+    if mc_t0:
+        if 5000 <= mc_t0 < 15000:    score += 3   # melhor faixa (win 45.9%)
+        elif 15000 <= mc_t0 < 30000: score += 1   # acima da média (win 36.0%)
+        elif mc_t0 < 5000:           score -= 1   # muito pequeno (win 30.7%)
+        elif 30000 <= mc_t0 < 120000: score += 0  # neutro (win ~33%)
+        elif mc_t0 >= 120000:        score -= 2   # grande demais (win 5.6%)
 
-    # 2. RATIO BUY/SELL — pressão compradora
+    # 2. IDADE DO TOKEN — janela dourada 45-60min descoberta nos dados
+    if idade_min is not None:
+        if 45 <= idade_min <= 60:    score += 3   # win 83.3%
+        elif 25 <= idade_min < 45:   score += 2   # win 55.2%
+        elif 10 <= idade_min < 25:   score += 1   # win 43.3%
+        elif idade_min < 10:         score += 0   # muito novo, neutro (win 33.9%)
+        elif idade_min > 120:        score -= 1   # token velho (win 35.7%)
+
+    # 3. BC PROGRESS — relação NÃO é linear: 40-80 é o ideal
+    if bc_progress is not None:
+        if 40 <= bc_progress <= 80:  score += 2   # win ~55% (era penalizado no v7!)
+        elif bc_progress > 80:       score -= 1   # perto do topo (win 31.8%)
+        # <40: neutro (win 37.3%)
+
+    # 4. RATIO BUY/SELL — gradiente positivo claro nos dados
     total_txns = (buys or 0) + (sells or 0)
     if total_txns > 0:
         ratio_bs = buys / total_txns
-        if ratio_bs >= 0.70:          score += 2
-        elif ratio_bs >= 0.55:        score += 1
-        elif ratio_bs >= 0.40:        score += 0
-        else:                         score -= 2
+        if ratio_bs >= 0.65:         score += 2   # win 42.9%
+        elif ratio_bs >= 0.55:       score += 1   # win 38.3%
+        elif ratio_bs >= 0.40:       score += 0   # neutro (win 36.3%)
+        else:                        score -= 1   # win 32.7%
 
-    # 3. MARKET CAP — faixa ampliada (era 30k-60k, agora 15k-80k)
-    if mc_t0:
-        if 15000 <= mc_t0 <= 80000:   score += 2
-        elif 5000 <= mc_t0 < 15000:   score += 1
-        elif 80000 < mc_t0 <= 150000: score += 0
-        elif mc_t0 > 150000:          score -= 2
-        elif mc_t0 < 5000:            score -= 1
+    # 5. TOP1_PCT — concentração do dev: >50% é sinal negativo
+    if top1_pct is not None:
+        if top1_pct > 50:            score -= 2   # win 23.2% — concentração perigosa
+        # 10-50%: neutro (~36-38% win)
 
-    # 4. IDADE DO TOKEN — corrigida inversão anterior
-    if idade_min is not None:
-        if 20 <= idade_min <= 60:     score += 2
-        elif 10 <= idade_min < 20:    score += 1
-        elif idade_min < 10:          score += 0   # muito novo, neutro
-        elif 60 < idade_min <= 120:   score += 0
-        elif idade_min > 120:         score -= 1
+    # 6. CARTEIRA — humanas têm performance muito superior
+    if carteira == "carteira_C":     score += 2   # win 61.9%
+    elif carteira == "carteira_D":   score += 1   # win 44.8%
+    # carteira_A/B: neutro (win 34.0%)
 
-    # 5. NET MOMENTUM
+    # 7. NET MOMENTUM
     if total_txns > 0:
         net = (buys or 0) - (sells or 0)
         if net >= 20:   score += 1
         elif net < 0:   score -= 1
 
-    # 6. MULTI-CARTEIRA — bônus confirmado pelos dados (win 43.8% vs 36.4%)
-    if is_multi:
-        score += 1
-
-    # 7. HOLDERS
+    # 8. HOLDERS
     if holders_count is not None:
-        if holders_count >= 200:      score += 1
-        elif holders_count < 80:      score -= 1
+        if holders_count >= 200:     score += 1
+        elif holders_count < 80:     score -= 1
 
-    # 8. DEV HISTORY
-    if dev_classif == "confiavel":    score += 1
-    elif dev_classif == "rugger":     score -= 3
+    # 9. DEV HISTORY
+    if dev_classif == "confiavel":   score += 2
+    elif dev_classif == "rugger":    score -= 3
 
-    # 9. RATIO VOL/MC — mantido mas sem bônus (correlação fraca)
+    # 10. RATIO VOL/MC — penalidade apenas para volume muito baixo
     if ratio_vol_mc is not None:
-        if ratio_vol_mc < 0.5:        score -= 1   # volume muito baixo
+        if ratio_vol_mc < 0.5:       score -= 1
 
-    # 10. DEX PUMPFUN — mantido
-    if dex == "pumpfun":
-        score += 1
-
-    # txns >= 80 REMOVIDO — correlação ~0 com var_pico (dados reais)
+    # Removidos (importância ~0): is_pumpfun, is_multi, hora_utc
 
     score = max(0, min(10, score))
     if score >= 7:   return score, "🟢", "ALTA CONFIANÇA"
@@ -1121,9 +1123,9 @@ def processar_tx(tx, carteira_addr, nome):
             holders_count=holders_count, top10_pct=top10_pct,
             buys=buys_5min, sells=sells_5min,
             dev_classif=dev_classif_score,
-            hora_utc=__import__("datetime").datetime.utcnow().hour,
-            is_multi=is_multi,
-            bc_progress=bc_progress
+            bc_progress=bc_progress,
+            top1_pct=top1_pct,
+            carteira=nome
         )
         ml_proba = calcular_ml_proba(
             mc_t0=mc_t0, liq_t0=liq_t0, volume_t0=volume_t0,
