@@ -1,0 +1,24 @@
+{
+  "features": [
+    "bc_progress",
+    "ratio_bs",
+    "log_mc",
+    "log_liq",
+    "log_vol",
+    "idade_min",
+    "ratio_vol_mc_t0",
+    "net_momentum_t0",
+    "holders_count",
+    "top10_pct",
+    "is_multi",
+    "is_pumpfun",
+    "score_qualidade"
+  ],
+  "n_train": 810,
+  "base_winrate": 0.37160493827160496,
+  "threshold_otimo": 0.4131152033805847,
+  "auc_cv": 0.5626909253123962,
+  "mae_cv": 97.68472267291868,
+  "data_treino": "2026-03-14",
+  "versao": "v1.0"
+}
