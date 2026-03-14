@@ -330,13 +330,10 @@ def db_carregar_estado():
                     if reg.get("mc_t3") is None:
                         delay = max(0, 2700 - segundos_passados)
                         threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t3"]).start()
-                    # Snapshots intermediários de pico
-                    if segundos_passados < 120:
-                        threading.Timer(max(0, 120 - segundos_passados), atualizar_pico, args=[nome, mint, "2min"]).start()
-                    if segundos_passados < 600:
-                        threading.Timer(max(0, 600 - segundos_passados), atualizar_pico, args=[nome, mint, "10min"]).start()
-                    if segundos_passados < 1500:
-                        threading.Timer(max(0, 1500 - segundos_passados), atualizar_pico, args=[nome, mint, "25min"]).start()
+                    # Loop contínuo de pico (a cada 2min até 45min)
+                    if segundos_passados < 43 * 60:
+                        elapsed_min = max(2, int(segundos_passados / 60) + 2)
+                        threading.Timer(2 * 60, loop_pico, args=[nome, mint, elapsed_min]).start()
         log(f"✅ Estado restaurado — {sum(len(estado[n]['registros']) for n in estado)} registros em memória")
     except Exception as e:
         log(f"⚠️  Erro ao carregar estado do banco: {e}")
@@ -919,61 +916,68 @@ def agendar_checkpoints(nome, mint):
     threading.Timer(5  * 60, checar_checkpoint, args=[nome, mint, "t1"]).start()
     threading.Timer(15 * 60, checar_checkpoint, args=[nome, mint, "t2"]).start()
     threading.Timer(45 * 60, checar_checkpoint, args=[nome, mint, "t3"]).start()
-    threading.Timer(2  * 60, atualizar_pico, args=[nome, mint, "2min"]).start()
-    threading.Timer(10 * 60, atualizar_pico, args=[nome, mint, "10min"]).start()
-    threading.Timer(25 * 60, atualizar_pico, args=[nome, mint, "25min"]).start()
-def atualizar_pico(nome, mint, label):
+    threading.Timer(2  * 60, loop_pico, args=[nome, mint, 2]).start()
+def loop_pico(nome, mint, elapsed_min):
+    """Polling de mc_pico a cada 2min até 45min. Para antecipadamente se token morreu."""
     est = estado[nome]
     if mint not in est["pendentes"]:
         return
-    info = est["pendentes"][mint]
-    reg  = est["registros"][info["idx"]]
+    info  = est["pendentes"][mint]
+    reg   = est["registros"][info["idx"]]
     db_id = info.get("db_id")
     try:
-        _, mc_atual, _, _, _, txns_atual, _, _, _, buys_atual, sells_atual = get_dados_token(mint)
-        if not mc_atual or mc_atual == 0:
-            return
-        mc_pico_atual = reg.get("mc_pico") or 0
-        if mc_atual > mc_pico_atual:
-            reg["mc_pico"] = mc_atual
-            log(f"  📈 [{nome}] Pico atualizado {label}: {reg['nome'][:20]} | MC: ${mc_atual:,.0f} (era ${mc_pico_atual:,.0f})")
-            if db_id:
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("UPDATE registros SET mc_pico=%s WHERE id=%s", (mc_atual, db_id))
-                    conn.commit()
-        if label == "2min" and txns_atual is not None:
-            txns_t0 = reg.get("txns5m_t0") or 0
-            acel = round(txns_atual / txns_t0, 2) if txns_t0 > 0 else None
-            reg["aceleracao_2min"] = acel
-            reg["txns_2min"]       = txns_atual
-            reg["buys_2min"]       = buys_atual
-            reg["sells_2min"]      = sells_atual
-            if acel:
-                if acel >= 3:    emoji = "🚀"
-                elif acel >= 1.5: emoji = "📈"
-                elif acel < 0.8:  emoji = "📉"
-                else:             emoji = "➡️"
-                log(f"  ⚡ [{nome}] Acel 2min: {reg['nome'][:20]} | txns: {txns_t0}→{txns_atual} ({acel}x) {emoji}")
-            score_atual = reg.get("score_qualidade") or 0
-            bonus_acel = 0
-            if acel is not None:
-                if acel >= 3:    bonus_acel = 1
-                elif acel < 0.8: bonus_acel = -1
-            if bonus_acel != 0:
-                novo_score = max(0, min(10, score_atual + bonus_acel))
-                reg["score_qualidade"] = novo_score
-                if novo_score >= 7:   reg["score_emoji"] = "🟢"
-                elif novo_score >= 4: reg["score_emoji"] = "🟡"
-                else:                 reg["score_emoji"] = "🔴"
-                log(f"  🔄 [{nome}] Score ajustado por aceleração: {score_atual}→{novo_score} (acel={acel}x)")
+        _, mc_atual, _, _, _, _, txns_atual, _, _, buys_atual, sells_atual = get_dados_token(mint)
+        if mc_atual and mc_atual > 0:
+            mc_pico_atual = reg.get("mc_pico") or 0
+            if mc_atual > mc_pico_atual:
+                reg["mc_pico"] = mc_atual
+                log(f"  📈 [{nome}] Pico {elapsed_min}min: {reg['nome'][:20]} | ${mc_atual:,.0f} (era ${mc_pico_atual:,.0f})")
                 if db_id:
                     with get_conn() as conn:
                         with conn.cursor() as cur:
-                            cur.execute("UPDATE registros SET score_qualidade=%s WHERE id=%s", (novo_score, db_id))
+                            cur.execute("UPDATE registros SET mc_pico=%s WHERE id=%s", (mc_atual, db_id))
                         conn.commit()
+            # Aceleração apenas no primeiro poll (2min)
+            if elapsed_min == 2 and txns_atual is not None:
+                txns_t0 = reg.get("txns5m_t0") or 0
+                acel = round(txns_atual / txns_t0, 2) if txns_t0 > 0 else None
+                reg["aceleracao_2min"] = acel
+                reg["txns_2min"]       = txns_atual
+                reg["buys_2min"]       = buys_atual
+                reg["sells_2min"]      = sells_atual
+                if acel:
+                    if acel >= 3:     emoji = "🚀"
+                    elif acel >= 1.5: emoji = "📈"
+                    elif acel < 0.8:  emoji = "📉"
+                    else:             emoji = "➡️"
+                    log(f"  ⚡ [{nome}] Acel 2min: {reg['nome'][:20]} | txns: {txns_t0}→{txns_atual} ({acel}x) {emoji}")
+                score_atual = reg.get("score_qualidade") or 0
+                bonus_acel = 0
+                if acel is not None:
+                    if acel >= 3:    bonus_acel = 1
+                    elif acel < 0.8: bonus_acel = -1
+                if bonus_acel != 0:
+                    novo_score = max(0, min(10, score_atual + bonus_acel))
+                    reg["score_qualidade"] = novo_score
+                    if novo_score >= 7:   reg["score_emoji"] = "🟢"
+                    elif novo_score >= 4: reg["score_emoji"] = "🟡"
+                    else:                 reg["score_emoji"] = "🔴"
+                    log(f"  🔄 [{nome}] Score ajustado por aceleração: {score_atual}→{novo_score} (acel={acel}x)")
+                    if db_id:
+                        with get_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("UPDATE registros SET score_qualidade=%s WHERE id=%s", (novo_score, db_id))
+                            conn.commit()
+            # Parar antecipadamente se token morreu
+            mc_pico_ref = reg.get("mc_pico") or 0
+            morreu = mc_atual < 3000 or (mc_pico_ref > 0 and mc_atual < mc_pico_ref * 0.25)
+            if morreu:
+                log(f"  💀 [{nome}] Polling encerrado {elapsed_min}min: {reg['nome'][:20]} | MC: ${mc_atual:,.0f}")
+                return
     except Exception as e:
-        log(f"⚠️  atualizar_pico erro [{label}]: {e}")
+        log(f"⚠️  loop_pico erro [{elapsed_min}min]: {e}")
+    if elapsed_min < 43:
+        threading.Timer(2 * 60, loop_pico, args=[nome, mint, elapsed_min + 2]).start()
 def checar_checkpoint(nome, mint, checkpoint, _retry=0):
     est = estado[nome]
     if mint not in est["pendentes"]:
