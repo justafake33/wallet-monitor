@@ -4,12 +4,63 @@ import time
 import threading
 import os
 import json
+import pickle
 import html as html_lib
 import psycopg2
 import psycopg2.extras
+import numpy as np
 from datetime import datetime
 from flask import Flask, request, jsonify
 # v6.3 + PostgreSQL — dados persistentes entre restarts
+
+# ── ML Score ─────────────────────────────────────────────────────────────────
+_ML_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _carregar_modelos_ml():
+    try:
+        with open(os.path.join(_ML_DIR, 'modelo_binario.pkl'), 'rb') as f:
+            cls = pickle.load(f)
+        with open(os.path.join(_ML_DIR, 'feature_cols.pkl'), 'rb') as f:
+            feats = pickle.load(f)
+        log("[ML] Modelos carregados com sucesso")
+        return cls, feats
+    except Exception as e:
+        print(f"[ML] Modelos não encontrados (treinar ml_score.ipynb primeiro): {e}")
+        return None, None
+
+_ML_MODEL  = None
+_ML_FEATS  = None
+
+def calcular_ml_proba(mc_t0, liq_t0, volume_t0, buys, sells, idade_min,
+                      ratio_vol_mc, net_momentum, holders_count,
+                      top10_pct, is_multi, dex, bc_progress, score_qualidade):
+    """Retorna P(var_pico > 50%) entre 0.0 e 1.0. None se modelo indisponível."""
+    if _ML_MODEL is None:
+        return None
+    try:
+        total = (buys or 0) + (sells or 0)
+        ratio_bs = (buys or 0) / total if total > 0 else np.nan
+        row = {
+            'bc_progress':     bc_progress if bc_progress is not None else np.nan,
+            'ratio_bs':        ratio_bs,
+            'log_mc':          np.log1p(max(mc_t0 or 0, 0)),
+            'log_liq':         np.log1p(max(liq_t0 or 0, 0)),
+            'log_vol':         np.log1p(max(volume_t0 or 0, 0)),
+            'idade_min':       idade_min if idade_min is not None else np.nan,
+            'ratio_vol_mc_t0': ratio_vol_mc if ratio_vol_mc is not None else np.nan,
+            'net_momentum_t0': net_momentum or 0,
+            'holders_count':   holders_count if holders_count is not None else np.nan,
+            'top10_pct':       top10_pct if top10_pct is not None else np.nan,
+            'is_multi':        int(bool(is_multi)),
+            'is_pumpfun':      int(dex == 'pumpfun'),
+            'score_qualidade': score_qualidade if score_qualidade is not None else np.nan,
+        }
+        X = pd.DataFrame([row])[_ML_FEATS]
+        proba = _ML_MODEL.predict_proba(X)[0, 1]
+        return round(float(proba), 3)
+    except Exception as e:
+        print(f"[ML] Erro ao calcular proba: {e}")
+        return None
 HELIUS_API_KEY = "4f586430-90ef-4c8f-9800-b98bfe5f1151"
 TELEGRAM_TOKEN = "8319320909:AAFnhGkFS1YxhthhE4RolutJScEjBCjIvrA"
 TELEGRAM_CHAT  = "-5284184650"
@@ -60,11 +111,12 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Migração: adicionar colunas holders T1/T2/T3 se não existirem
+            # Migração: adicionar colunas se não existirem
             for col_name, col_type in [
                 ("holders_t1","INT"),("top1_t1","FLOAT"),("top10_t1","FLOAT"),("dev_saiu_t1","BOOLEAN"),
                 ("holders_t2","INT"),("top1_t2","FLOAT"),("top10_t2","FLOAT"),("dev_saiu_t2","BOOLEAN"),
                 ("holders_t3","INT"),("top1_t3","FLOAT"),("top10_t3","FLOAT"),("dev_saiu_t3","BOOLEAN"),
+                ("ml_proba","FLOAT"),
             ]:
                 try:
                     cur.execute(f"ALTER TABLE registros ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
@@ -163,7 +215,7 @@ def db_insert(reg):
                     net_momentum_t0, idade_min, token_antigo, ratio_vol_mc_t0,
                     score_qualidade, holders_count, top1_pct, top10_pct,
                     dev_saiu, bc_progress, mc_pico, categoria_final,
-                    var_desde_compra
+                    var_desde_compra, ml_proba
                 ) VALUES (
                     %(data_compra)s, %(carteira)s, %(tipo_carteira)s, %(token_mint)s,
                     %(nome)s, %(dex)s, %(fonte_dados)s, %(quantidade)s, %(signature)s,
@@ -172,7 +224,8 @@ def db_insert(reg):
                     %(net_momentum_t0)s, %(idade_min)s, %(token_antigo)s,
                     %(ratio_vol_mc_t0)s, %(score_qualidade)s, %(holders_count)s,
                     %(top1_pct)s, %(top10_pct)s, %(dev_saiu)s, %(bc_progress)s,
-                    %(mc_pico)s, %(categoria_final)s, %(var_desde_compra)s
+                    %(mc_pico)s, %(categoria_final)s, %(var_desde_compra)s,
+                    %(ml_proba)s
                 ) RETURNING id
             """, reg)
             row_id = cur.fetchone()[0]
@@ -762,7 +815,7 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
                            ratio_vol_mc, idade_min, score, score_emoji, score_desc,
                            holders_count=None, top1_pct=None, top10_pct=None,
                            dev_saiu=None, bc_progress=None,
-                           buys_5min=0, sells_5min=0):
+                           buys_5min=0, sells_5min=0, ml_proba=None):
     agora = time.time()
     if mint not in mints_globais:
         mints_globais[mint] = {}
@@ -824,7 +877,8 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
         f"🕐 Idade: <b>{idade_min:.0f} min</b>\n"
         f"{holder_linha}"
         f"{momentum_linha}\n\n"
-        f"Score: {score_emoji} <b>{score}/10 — {score_desc}</b>\n\n"
+        f"Score: {score_emoji} <b>{score}/10 — {score_desc}</b>"
+        + (f" | 🤖 ML: <b>{ml_proba*100:.0f}%</b>" if ml_proba is not None else "") + "\n\n"
         f"🔗 https://pump.fun/{mint}"
     )
     log(f"🚨 MULTI: {nome_token} | {carteira_atual} + {list(recentes.keys())} | {timing_str}")
@@ -917,7 +971,7 @@ def atualizar_pico(nome, mint, label):
                         conn.commit()
     except Exception as e:
         log(f"⚠️  atualizar_pico erro [{label}]: {e}")
-def checar_checkpoint(nome, mint, checkpoint):
+def checar_checkpoint(nome, mint, checkpoint, _retry=0):
     est = estado[nome]
     if mint not in est["pendentes"]:
         return
@@ -925,6 +979,12 @@ def checar_checkpoint(nome, mint, checkpoint):
     reg   = est["registros"][info["idx"]]
     db_id = info.get("db_id")
     preco, mc, liq, volume, _, _, txns_5min, _, _, buys, sells = get_dados_token(mint)
+    # Se T1 ainda não tem dados e temos retentativas disponíveis, reagendar
+    if checkpoint == "t1" and (not mc or mc == 0) and _retry < 2:
+        delay = 60 * (_retry + 1)  # 60s na 1ª, 120s na 2ª
+        log(f"  ⏳ [{nome}] T1 mc=0 (retry {_retry+1}/2), reagendando em {delay}s: {reg['nome'][:20]}")
+        threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t1", _retry + 1]).start()
+        return
     ratio = round(volume / reg["mc_t0"], 2) if reg.get("mc_t0", 0) > 0 else None
     if checkpoint == "t1":
         var_t1 = round((preco - reg["p_t0"]) / reg["p_t0"] * 100, 2) if preco and reg.get("p_t0") else None
@@ -1064,6 +1124,14 @@ def processar_tx(tx, carteira_addr, nome):
             is_multi=is_multi,
             bc_progress=bc_progress
         )
+        ml_proba = calcular_ml_proba(
+            mc_t0=mc_t0, liq_t0=liq_t0, volume_t0=volume_t0,
+            buys=buys_5min, sells=sells_5min, idade_min=idade_min,
+            ratio_vol_mc=ratio_vol_mc_t0, net_momentum=(buys_5min or 0) - (sells_5min or 0),
+            holders_count=holders_count, top10_pct=top10_pct,
+            is_multi=is_multi, dex=dex, bc_progress=bc_progress,
+            score_qualidade=score
+        )
         flag_antigo = f" ⚠️ TOKEN ANTIGO ({idade_min/1440:.0f}d)" if token_antigo == "sim" else ""
         if not mc_t0 or mc_t0 == 0:
             log(f"⚠️  [{nome}] {nome_token} | MC=0 — token não indexado, ignorando checkpoints")
@@ -1106,6 +1174,7 @@ def processar_tx(tx, carteira_addr, nome):
                 "ratio_vol_mc_t3": None, "var_t3_%": None, "veredito_t3": None,
                 "mc_pico": 0, "var_pico_%": None, "var_desde_compra": None,
                 "categoria_final": "❓ SEM DADOS — MC não disponível",
+                "ml_proba": None,
             }
             est["registros"].append(reg_sem_dados)
             try:
@@ -1137,6 +1206,7 @@ def processar_tx(tx, carteira_addr, nome):
             "ratio_vol_mc_t3": None, "var_t3_%": None, "veredito_t3": None,
             "mc_pico": mc_t0, "var_pico_%": None, "var_desde_compra": None,
             "categoria_final": "⏳ aguardando",
+            "ml_proba": ml_proba,
         }
         idx = len(est["registros"])
         est["registros"].append(reg)
@@ -1152,7 +1222,7 @@ def processar_tx(tx, carteira_addr, nome):
             score, score_emoji, score_desc,
             holders_count=holders_count, top1_pct=top1_pct,
             top10_pct=top10_pct, dev_saiu=dev_saiu, bc_progress=bc_progress,
-            buys_5min=buys_5min, sells_5min=sells_5min,
+            buys_5min=buys_5min, sells_5min=sells_5min, ml_proba=ml_proba,
         )
         est["registros"][idx]["is_multi"] = bool(is_multi)
         if is_multi and db_id:
@@ -1464,6 +1534,7 @@ def dados():
                 "var_t2_%": r.get("var_t2_%"),
                 "var_t3_%": r.get("var_t3_%"),
                 "score_qualidade": r.get("score_qualidade"),
+                "ml_proba": r.get("ml_proba"),
             })
         multi_entry = dict(base)
         multi_entry["entradas"] = entradas
@@ -1520,8 +1591,10 @@ def rota_analise():
 # STARTUP
 # ══════════════════════════════════════════════════════════
 def startup():
+    global _ML_MODEL, _ML_FEATS
     time.sleep(3)
     init_db()
+    _ML_MODEL, _ML_FEATS = _carregar_modelos_ml()
     db_carregar_estado()
     total = sum(len(estado[n]["registros"]) for n in estado)
     telegram(
