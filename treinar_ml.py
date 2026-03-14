@@ -61,6 +61,13 @@ FEATURES = [
     'holders_count', 'top10_pct', 'is_multi', 'is_pumpfun', 'score_qualidade',
 ]
 
+nulls_antes = df2['bc_progress'].isna().sum()
+df2['bc_progress'] = df2['bc_progress'].fillna(
+    (df2['mc_t0'].clip(lower=0) / 65000 * 100).clip(upper=100)
+)
+nulls_depois = df2['bc_progress'].isna().sum()
+print(f"  bc_progress: {nulls_antes} NULLs → {nulls_depois} restantes após estimativa via mc_t0/65k")
+
 df_ml = df2.dropna(subset=['log_mc', 'idade_min', 'var_pico']).copy()
 for col in FEATURES:
     if df_ml[col].isna().any():
