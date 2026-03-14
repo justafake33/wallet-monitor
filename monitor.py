@@ -906,6 +906,7 @@ def processar_venda(carteira_addr, nome, mint, amount_vendido, tx):
         "score_qualidade": None, "holders_count": None, "top1_pct": None,
         "top10_pct": None, "dev_saiu": None, "bc_progress": None,
         "mc_pico": None, "categoria_final": "🔴 VENDA", "var_desde_compra": variacao,
+        "ml_proba": None,
     }
     est["registros"].append(reg_venda)
     try:
