@@ -61,7 +61,7 @@ FEATURES = [
     'holders_count', 'top10_pct', 'is_multi', 'is_pumpfun', 'score_qualidade',
 ]
 
-df_ml = df2.dropna(subset=['bc_progress', 'log_mc', 'idade_min', 'var_pico']).copy()
+df_ml = df2.dropna(subset=['log_mc', 'idade_min', 'var_pico']).copy()
 for col in FEATURES:
     if df_ml[col].isna().any():
         mediana = df_ml[col].median()
