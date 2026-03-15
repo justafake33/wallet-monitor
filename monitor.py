@@ -497,19 +497,23 @@ def categoria_final(reg):
     t3_morreu = mc3 == 0 or (var_t3 is not None and var_t3 < -70)
     if var_t1 and var_t1 > 50 and t2_morreu:
         return "🎯 PUMP & DUMP — Morreu após T1"
-    if var_t1 and var_t1 > 50 and mc3 > 0 and t3_morreu:
+    if var_t1 and var_t1 > 50 and t3_morreu:
         return "🎯 PUMP & DUMP — Morreu após pico"
-    pico = max(mc1, mc2, mc3)
+    # Bug fix: usar mc_pico acumulado pelo loop_pico (a cada 2min), não só os checkpoints
+    mc_pico_acum = reg.get("mc_pico") or 0
+    pico = max(mc1, mc2, mc3, mc_pico_acum)
     var_pico  = (pico - mc0) / mc0 * 100 if mc0 else 0
-    var_final = (mc3  - mc0) / mc0 * 100 if mc0 and mc3 else None
-    if   var_pico > 200 and var_final and var_final >  100: return "🏆 VENCEDOR — Subiu forte e manteve"
-    elif var_pico > 200 and var_final and var_final <    0: return "🎯 PUMP & DUMP — Subiu e colapsou"
-    elif var_pico >  50 and var_final and var_final >   20: return "📈 BOM TRADE — Crescimento sólido"
-    elif var_pico >  50 and var_final and var_final <  -20: return "⚠️  ARMADILHA — Pico rápido e queda"
-    elif var_final and var_final >  20:                     return "📊 CRESCIMENTO ESTÁVEL"
-    elif var_final and var_final > -20:                     return "➡️  LATERAL — Pouco movimento"
-    elif var_final is not None:                             return "💀 MORREU — Queda consistente"
-    else:                                                   return "❓ DADOS INCOMPLETOS"
+    # Bug fix: mc3==0 significa token morreu — tratar como var_final=-100 em vez de None→DADOS INCOMPLETOS
+    var_final = (mc3 - mc0) / mc0 * 100 if mc0 and mc3 else (-100 if mc3 == 0 and mc1 > 0 else None)
+    if   var_pico > 200 and var_final is not None and var_final >  100: return "🏆 VENCEDOR — Subiu forte e manteve"
+    elif var_pico > 200 and var_final is not None and var_final >   20: return "📈 BOM TRADE — Crescimento sólido"
+    elif var_pico > 200 and var_final is not None and var_final <    0: return "🎯 PUMP & DUMP — Subiu e colapsou"
+    elif var_pico >  50 and var_final is not None and var_final >   20: return "📈 BOM TRADE — Crescimento sólido"
+    elif var_pico >  50 and var_final is not None and var_final <  -20: return "⚠️  ARMADILHA — Pico rápido e queda"
+    elif var_final is not None and var_final >  20:                     return "📊 CRESCIMENTO ESTÁVEL"
+    elif var_final is not None and var_final > -20:                     return "➡️  LATERAL — Pouco movimento"
+    elif var_final is not None:                                         return "💀 MORREU — Queda consistente"
+    else:                                                               return "❓ DADOS INCOMPLETOS"
 def get_dados_token(mint):
     preco = mc = liq = volume = 0
     dex = nome = "?"
@@ -627,9 +631,8 @@ def get_deployer_history(dev_wallet):
                 """, (dev_wallet,))
                 row = cur.fetchone()
                 if row:
-                    from datetime import datetime, timezone
                     ultima = row[4]
-                    if ultima and (datetime.now() - ultima.replace(tzinfo=None)).seconds < 21600:
+                    if ultima and (datetime.now() - ultima.replace(tzinfo=None)).total_seconds() < 21600:
                         return row[0], row[1], row[2], row[3]
         r = requests.post(HELIUS_URL,
             json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress",
@@ -885,13 +888,11 @@ def checar_multi_carteira(mint, nome_token, carteira_atual, mc_t0, liq_t0,
 def processar_venda(carteira_addr, nome, mint, amount_vendido, tx):
     est = estado[nome]
     reg = next((r for r in est["registros"] if r.get("token_mint") == mint), None)
-    _, mc_atual, _, _, _, nome_token, _, _, _, _, _ = get_dados_token(mint)
+    preco_atual, mc_atual, _, _, _, nome_token, _, _, _, _, _ = get_dados_token(mint)
     nome_token = reg["nome"] if reg else nome_token
     variacao = None
-    if reg and reg.get("p_t0"):
-        preco_atual, _, _, _, _, _, _, _, _, _, _ = get_dados_token(mint)
-        if preco_atual:
-            variacao = round((preco_atual - reg["p_t0"]) / reg["p_t0"] * 100, 2)
+    if reg and reg.get("p_t0") and preco_atual:
+        variacao = round((preco_atual - reg["p_t0"]) / reg["p_t0"] * 100, 2)
     log(f"🔴 [{nome}] VENDA: {nome_token} | MC: ${mc_atual:,.0f} | variação: {f'{variacao:+.1f}%' if variacao is not None else '—'}")
     data = datetime.fromtimestamp(tx.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
     reg_venda = {
@@ -986,11 +987,12 @@ def checar_checkpoint(nome, mint, checkpoint, _retry=0):
     reg   = est["registros"][info["idx"]]
     db_id = info.get("db_id")
     preco, mc, liq, volume, _, _, txns_5min, _, _, buys, sells = get_dados_token(mint)
-    # Se T1 ainda não tem dados e temos retentativas disponíveis, reagendar
-    if checkpoint == "t1" and (not mc or mc == 0) and _retry < 2:
+    # Se ainda não tem dados e temos retentativas disponíveis, reagendar (T1 até 2x, T2/T3 até 1x)
+    max_retry = 2 if checkpoint == "t1" else 1
+    if (not mc or mc == 0) and _retry < max_retry:
         delay = 60 * (_retry + 1)  # 60s na 1ª, 120s na 2ª
-        log(f"  ⏳ [{nome}] T1 mc=0 (retry {_retry+1}/2), reagendando em {delay}s: {reg['nome'][:20]}")
-        threading.Timer(delay, checar_checkpoint, args=[nome, mint, "t1", _retry + 1]).start()
+        log(f"  ⏳ [{nome}] {checkpoint.upper()} mc=0 (retry {_retry+1}/{max_retry}), reagendando em {delay}s: {reg['nome'][:20]}")
+        threading.Timer(delay, checar_checkpoint, args=[nome, mint, checkpoint, _retry + 1]).start()
         return
     ratio = round(volume / reg["mc_t0"], 2) if reg.get("mc_t0", 0) > 0 else None
     if checkpoint == "t1":
@@ -1125,6 +1127,15 @@ def processar_tx(tx, carteira_addr, nome):
             bc_progress=bc_progress,
             top1_pct=top1_pct,
             carteira=nome
+        )
+        # Detectar multi-carteira ANTES de calcular ML para que is_multi seja correto
+        agora_ts = time.time()
+        if mint not in mints_globais:
+            mints_globais[mint] = {}
+        mints_globais[mint][nome] = agora_ts
+        is_multi = bool(
+            {c: ts for c, ts in mints_globais[mint].items()
+             if c != nome and (agora_ts - ts) / 60 <= 60}
         )
         ml_proba = calcular_ml_proba(
             mc_t0=mc_t0, liq_t0=liq_t0, volume_t0=volume_t0,
@@ -1328,20 +1339,20 @@ def verificar_calibracao():
             d = disc("ratio_bs≥70% (+3) vs <40% (-2)", bons, ruins, 3, -2)
             if d: criterios.append(d)
 
-        # mc_t0
+        # mc_t0 — thresholds v8: 5k-15k melhor faixa
         rows_mc = [r for r in rows if r.get("mc_t0")]
         if rows_mc:
-            bons  = [r for r in rows_mc if 30000 <= r["mc_t0"] <= 60000]
-            ruins = [r for r in rows_mc if r["mc_t0"] > 60000]
-            d = disc("mc_t0 30k-60k (+2) vs >60k (-2)", bons, ruins, 2, -2)
+            bons  = [r for r in rows_mc if 5000 <= r["mc_t0"] < 15000]
+            ruins = [r for r in rows_mc if r["mc_t0"] >= 120000]
+            d = disc("mc_t0 5k-15k (+3) vs ≥120k (-2)", bons, ruins, 3, -2)
             if d: criterios.append(d)
 
-        # idade_min
+        # idade_min — thresholds v8: 45-60min janela dourada
         rows_id = [r for r in rows if r.get("idade_min") is not None]
         if rows_id:
-            bons  = [r for r in rows_id if 25 <= r["idade_min"] <= 60]
-            ruins = [r for r in rows_id if 10 < r["idade_min"] < 25]
-            d = disc("idade 25-60min (+2) vs 10-25min (-2)", bons, ruins, 2, -2)
+            bons  = [r for r in rows_id if 45 <= r["idade_min"] <= 60]
+            ruins = [r for r in rows_id if r["idade_min"] > 120]
+            d = disc("idade 45-60min (+3) vs >120min (-1)", bons, ruins, 3, -1)
             if d: criterios.append(d)
 
         # holders_count
@@ -1352,12 +1363,12 @@ def verificar_calibracao():
             d = disc("holders≥200 (+1) vs <80 (-1)", bons, ruins, 1, -1)
             if d: criterios.append(d)
 
-        # bc_progress
+        # bc_progress — thresholds v8: 40-80% é ideal
         rows_bc = [r for r in rows if r.get("bc_progress") is not None]
         if rows_bc:
-            bons  = [r for r in rows_bc if r["bc_progress"] < 30]
-            ruins = [r for r in rows_bc if r["bc_progress"] >= 60]
-            d = disc("bc_progress<30% (+1) vs ≥60% (-1)", bons, ruins, 1, -1)
+            bons  = [r for r in rows_bc if 40 <= r["bc_progress"] <= 80]
+            ruins = [r for r in rows_bc if r["bc_progress"] > 80]
+            d = disc("bc_progress 40-80% (+2) vs >80% (-1)", bons, ruins, 2, -1)
             if d: criterios.append(d)
 
         # ratio_vol_mc
@@ -1476,7 +1487,7 @@ def webhook():
             for acc in tx.get("accountData", []):
                 addr = acc.get("account", "")
                 if addr in CARTEIRAS:
-                    processar_tx(tx, addr, CARTEIRAS[addr])
+                    threading.Thread(target=processar_tx, args=[tx, addr, CARTEIRAS[addr]], daemon=True).start()
                     break
         return jsonify({"ok": True})
     except Exception as e:
