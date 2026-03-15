@@ -191,6 +191,60 @@ def main():
         (">5.0",        lambda x: x >= 5.0),
     ])
 
+    # ── 11. Top10 holders ────────────────────────────────
+    analisar_faixa(rows, "top10_pct", [
+        ("<20%",        lambda x: x < 20),
+        ("20–35%",      lambda x: 20 <= x < 35),
+        ("35–50%",      lambda x: 35 <= x < 50),
+        ("50–65%",      lambda x: 50 <= x < 65),
+        ("65–80%",      lambda x: 65 <= x < 80),
+        (">80%",        lambda x: x >= 80),
+    ])
+
+    # ── 12. Holders dentro da faixa MC $5k–$15k ──────────
+    mc_5_15 = [r for r in rows if r["mc_t0"] is not None and 5_000 <= r["mc_t0"] < 15_000]
+    print(f"\n{'='*55}")
+    print(f"  HOLDERS — apenas MC $5k–$15k (n={len(mc_5_15)})")
+    print(f"{'='*55}")
+    print(f"  {'Faixa':<22} {'N':>5} {'Winrate':>9} {'Mediana':>9}")
+    print(f"  {'-'*45}")
+    faixas_holders = [
+        ("<50",        lambda x: x < 50),
+        ("50–100",     lambda x: 50 <= x < 100),
+        ("100–200",    lambda x: 100 <= x < 200),
+        ("200–500",    lambda x: 200 <= x < 500),
+        (">500",       lambda x: x >= 500),
+    ]
+    for label, fn in faixas_holders:
+        subset = [r for r in mc_5_15 if r["holders_count"] is not None and fn(r["holders_count"])]
+        if not subset:
+            continue
+        wins = sum(1 for r in subset if r["var_pico"] > 50)
+        varps = [r["var_pico"] for r in subset]
+        print(f"  {label:<22} {len(subset):>5} {pct(wins,len(subset)):>9} {str(med(varps)):>9}")
+
+    # ── 13. Top10 holders dentro da faixa MC $5k–$15k ────
+    print(f"\n{'='*55}")
+    print(f"  TOP10 HOLDERS % — apenas MC $5k–$15k (n={len(mc_5_15)})")
+    print(f"{'='*55}")
+    print(f"  {'Faixa':<22} {'N':>5} {'Winrate':>9} {'Mediana':>9}")
+    print(f"  {'-'*45}")
+    faixas_top10 = [
+        ("<20%",        lambda x: x < 20),
+        ("20–35%",      lambda x: 20 <= x < 35),
+        ("35–50%",      lambda x: 35 <= x < 50),
+        ("50–65%",      lambda x: 50 <= x < 65),
+        ("65–80%",      lambda x: 65 <= x < 80),
+        (">80%",        lambda x: x >= 80),
+    ]
+    for label, fn in faixas_top10:
+        subset = [r for r in mc_5_15 if r["top10_pct"] is not None and fn(r["top10_pct"])]
+        if not subset:
+            continue
+        wins = sum(1 for r in subset if r["var_pico"] > 50)
+        varps = [r["var_pico"] for r in subset]
+        print(f"  {label:<22} {len(subset):>5} {pct(wins,len(subset)):>9} {str(med(varps)):>9}")
+
     print(f"\n{'#'*55}")
     print("  FIM — use esses dados para calibrar os filtros do scout.py")
     print(f"{'#'*55}\n")
