@@ -353,22 +353,23 @@ function renderHist(hs){
 function HOLD_EVO(a){
   var h0=a.holders_count, h1=a.holders_t1, h2=a.holders_t2, h3=a.holders_t3;
   if(!h0 && !h1) return '<span style="color:var(--sub)">-</span>';
+  var fmt=function(v){ return v>=1000?'1k+':v; };
   var parts=[];
-  if(h0!=null) parts.push('<span style="color:var(--sub)">'+h0+'</span>');
+  if(h0!=null) parts.push('<span style="color:var(--sub)">'+fmt(h0)+'</span>');
   if(h1!=null){
     var d=h1-(h0||0);
     var c=d>0?'var(--acc)':d<0?'var(--dng)':'var(--sub)';
-    parts.push('<span style="color:'+c+'">'+h1+(d>0?'<small> +'+d+'</small>':'')+'</span>');
+    parts.push('<span style="color:'+c+'">'+fmt(h1)+(d>0&&h1<1000?'<small> +'+d+'</small>':'')+'</span>');
   }
   if(h2!=null){
     var d2=h2-(h1||h0||0);
     var c2=d2>0?'var(--acc)':d2<0?'var(--dng)':'var(--sub)';
-    parts.push('<span style="color:'+c2+'">'+h2+(d2>0?'<small> +'+d2+'</small>':'')+'</span>');
+    parts.push('<span style="color:'+c2+'">'+fmt(h2)+(d2>0&&h2<1000?'<small> +'+d2+'</small>':'')+'</span>');
   }
   if(h3!=null){
     var d3=h3-(h2||h1||h0||0);
     var c3=d3>0?'var(--acc)':d3<0?'var(--dng)':'var(--sub)';
-    parts.push('<span style="color:'+c3+'">'+h3+(d3>0?'<small> +'+d3+'</small>':'')+'</span>');
+    parts.push('<span style="color:'+c3+'">'+fmt(h3)+(d3>0&&h3<1000?'<small> +'+d3+'</small>':'')+'</span>');
   }
   return '<div style="font-size:11px;line-height:1.8">'+parts.join('<span style="color:var(--sub)"> → </span>')+'</div>';
 }
