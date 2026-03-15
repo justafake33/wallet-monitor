@@ -15,8 +15,10 @@ HELIUS_API_KEY  = os.environ.get("HELIUS_API_KEY", "")
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT   = os.environ.get("TELEGRAM_CHAT", "")
 # Prefere PUBLIC URL pois railway.internal pode não resolver (private networking)
-DATABASE_URL    = (os.environ.get("DATABASE_PUBLIC_URL") or
-                   os.environ.get("DATABASE_URL") or "")
+_db_public = os.environ.get("DATABASE_PUBLIC_URL", "")
+_db_intern = os.environ.get("DATABASE_URL", "")
+print(f"[DB] DATABASE_PUBLIC_URL set={bool(_db_public)} DATABASE_URL host={'railway.internal' if 'railway.internal' in _db_intern else 'other'}", flush=True)
+DATABASE_URL    = _db_public or _db_intern or ""
 WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")
 
 DEV_WALLETS     = {
