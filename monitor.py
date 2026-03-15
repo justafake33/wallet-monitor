@@ -394,16 +394,10 @@ def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
                    holders_count=None, top10_pct=None, buys=0, sells=0,
                    dev_classif=None, hora_utc=None, is_multi=False,
                    bc_progress=None, top1_pct=None, carteira=None):
-    # v8.0 — score recalibrado com base em 1004 registros reais (14/03/2026)
-    # Mudanças vs v7:
-    #   mc_t0: faixa ideal corrigida para 5k-15k (+3), 30-60k deixou de ser sweet spot
-    #   idade_min: janela 45-60min separada (+3, win 83.3%)
-    #   bc_progress: INVERTIDO — 40-80 é o melhor (não <30)
-    #   ratio_bs: gradiente ajustado, ≥65% = +2
-    #   top1_pct: adicionado — >50% penaliza (-2)
-    #   carteira: bônus para carteira_C (+2) e carteira_D (+1)
-    #   is_multi, is_pumpfun, hora_utc: removidos (importância ~0)
-    #   dev_classif: confiavel mantido em +2
+    # v8.1 — adicionado liq_t0 como critério (15/03/2026)
+    # Mudanças vs v8.0:
+    #   liq_t0 absoluta: sweet spot $5k-10k (+1, win 51.2%)
+    #   liq/mc ratio: ≥1.0 bônus +2 (win 60.0%), base sólida
     score = 0
     if dev_classif == "serial_rugger":
         return 0, "💀", "SERIAL RUGGER — BLOQUEADO"
@@ -467,6 +461,13 @@ def calcular_score(mc_t0, liq_t0, txns, ratio_vol_mc, idade_min, dex,
     # 10. RATIO VOL/MC — penalidade apenas para volume muito baixo
     if ratio_vol_mc is not None:
         if ratio_vol_mc < 0.5:       score -= 1
+
+    # 11. LIQUIDEZ — liq absoluta e ratio liq/mc (análise 15/03/2026, n=447)
+    if liq_t0 and liq_t0 > 0 and mc_t0 and mc_t0 > 0:
+        ratio_liq_mc = liq_t0 / mc_t0
+        if ratio_liq_mc >= 1.0:      score += 2   # liq > mc — base sólida (win 60.0%)
+        if 5000 <= liq_t0 < 10000:   score += 1   # sweet spot absoluto (win 51.2%)
+        elif liq_t0 >= 20000:        score -= 1   # liq alta = token grande/caro (win 20.5%)
 
     # Removidos (importância ~0): is_pumpfun, is_multi, hora_utc
 
