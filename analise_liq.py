@@ -14,7 +14,7 @@ cur = conn.cursor()
 
 cur.execute("""
     SELECT liq_t0, mc_t0, var_pico
-    FROM tokens_monitorados
+    FROM registros
     WHERE liq_t0 IS NOT NULL AND liq_t0 > 0
       AND var_pico IS NOT NULL
       AND mc_t0 IS NOT NULL AND mc_t0 > 0
