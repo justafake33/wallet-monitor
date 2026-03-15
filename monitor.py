@@ -505,6 +505,9 @@ def categoria_final(reg):
     var_pico  = (pico - mc0) / mc0 * 100 if mc0 else 0
     # Bug fix: mc3==0 significa token morreu — tratar como var_final=-100 em vez de None→DADOS INCOMPLETOS
     var_final = (mc3 - mc0) / mc0 * 100 if mc0 and mc3 else (-100 if mc3 == 0 and mc1 > 0 else None)
+    # Gate de MC absoluto: pico < $10K é irrelevante independente da % de variação
+    if pico < 10_000:
+        return "➡️  LATERAL — MC irrelevante"
     if   var_pico > 200 and var_final is not None and var_final >  100: return "🏆 VENCEDOR — Subiu forte e manteve"
     elif var_pico > 200 and var_final is not None and var_final >   20: return "📈 BOM TRADE — Crescimento sólido"
     elif var_pico > 200 and var_final is not None and var_final <    0: return "🎯 PUMP & DUMP — Subiu e colapsou"
