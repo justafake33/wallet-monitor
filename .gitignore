@@ -1,0 +1,12 @@
+# Ambiente local
+novo_projeto_contexto.md
+wallet-monitor/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Jupyter
+.ipynb_checkpoints/
