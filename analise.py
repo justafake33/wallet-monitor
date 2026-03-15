@@ -151,7 +151,6 @@ def analise_categorias(rows):
     contagem = defaultdict(int)
     for r in rows:
         cat = r.get("categoria_final") or "?"
-        # normaliza: remove variações de emoji
         contagem[cat] += 1
     return sorted(contagem.items(), key=lambda x: x[1], reverse=True)
 
@@ -230,6 +229,117 @@ def analise_correlacao_multi_targets(rows):
         entry["max_abs_r"] = max(rs) if rs else 0
         resultado.append(entry)
     return sorted(resultado, key=lambda x: x["max_abs_r"], reverse=True)
+
+
+def analise_perfil_entrada(rows):
+    """
+    Compara mediana de cada feature entre winners (var_pico > 50%) e losers (var_pico < -50%).
+    Mostra qual direção favorece o winner e a diferença absoluta.
+    """
+    winners = [r for r in rows if r.get("var_pico") is not None and r["var_pico"] >  50]
+    losers  = [r for r in rows if r.get("var_pico") is not None and r["var_pico"] < -50]
+
+    feats = [
+        "score_qualidade", "mc_t0", "liq_t0", "volume_t0",
+        "txns5m_t0", "net_momentum_t0", "idade_min",
+        "ratio_vol_mc_t0", "holders_count", "bc_progress",
+        "top1_pct", "top10_pct",
+    ]
+
+    resultado = []
+    for feat in feats:
+        w_vals = [r[feat] for r in winners if r.get(feat) is not None]
+        l_vals = [r[feat] for r in losers  if r.get(feat) is not None]
+        mw = med(w_vals)
+        ml = med(l_vals)
+        diff = round(mw - ml, 1) if mw is not None and ml is not None else None
+        if diff is None:
+            sinal = "—"
+        elif diff > 0:
+            sinal = "↑ winner maior"
+        elif diff < 0:
+            sinal = "↓ loser maior"
+        else:
+            sinal = "="
+        resultado.append({
+            "feature":  feat,
+            "w_med":    mw,
+            "w_n":      len(w_vals),
+            "l_med":    ml,
+            "l_n":      len(l_vals),
+            "diff":     diff,
+            "sinal":    sinal,
+        })
+
+    return resultado, len(winners), len(losers)
+
+
+def analise_faixas_criticas(rows):
+    """
+    Para as features mais importantes, calcula win rate (var_pico > 50%) por faixa de valor.
+    Útil para identificar as condições de entrada com maior taxa de sucesso.
+    """
+    def win_rate_faixas(rows, feat, faixas):
+        resultado = []
+        for label, fn in faixas:
+            subset = [r for r in rows if r.get(feat) is not None and fn(r[feat])]
+            if not subset:
+                continue
+            wins = sum(1 for r in subset if r["var_pico"] > 50)
+            resultado.append({
+                "faixa":    label,
+                "n":        len(subset),
+                "win_rate": pct(wins, len(subset)),
+                "mediana":  med([r["var_pico"] for r in subset]),
+            })
+        return resultado
+
+    return {
+        "bc_progress": win_rate_faixas(rows, "bc_progress", [
+            ("< 20",    lambda v: v < 20),
+            ("20–40",   lambda v: 20 <= v < 40),
+            ("40–60",   lambda v: 40 <= v < 60),
+            ("60–80",   lambda v: 60 <= v < 80),
+            ("> 80",    lambda v: v >= 80),
+        ]),
+        "mc_t0 ($)": win_rate_faixas(rows, "mc_t0", [
+            ("< 5k",     lambda v: v < 5_000),
+            ("5k–15k",   lambda v: 5_000  <= v < 15_000),
+            ("15k–30k",  lambda v: 15_000 <= v < 30_000),
+            ("30k–60k",  lambda v: 30_000 <= v < 60_000),
+            ("60k–100k", lambda v: 60_000 <= v < 100_000),
+            ("> 100k",   lambda v: v >= 100_000),
+        ]),
+        "idade_min": win_rate_faixas(rows, "idade_min", [
+            ("≤ 10 min",   lambda v: v <= 10),
+            ("10–25 min",  lambda v: 10 < v <= 25),
+            ("25–60 min",  lambda v: 25 < v <= 60),
+            ("60–120 min", lambda v: 60 < v <= 120),
+            ("> 120 min",  lambda v: v > 120),
+        ]),
+        "ratio_vol_mc": win_rate_faixas(rows, "ratio_vol_mc_t0", [
+            ("< 0.5",  lambda v: v < 0.5),
+            ("0.5–1",  lambda v: 0.5 <= v < 1.0),
+            ("1–2",    lambda v: 1.0 <= v < 2.0),
+            ("2–4",    lambda v: 2.0 <= v < 4.0),
+            ("> 4",    lambda v: v >= 4.0),
+        ]),
+        "holders": win_rate_faixas(rows, "holders_count", [
+            ("< 50",     lambda v: v < 50),
+            ("50–100",   lambda v: 50  <= v < 100),
+            ("100–200",  lambda v: 100 <= v < 200),
+            ("200–400",  lambda v: 200 <= v < 400),
+            ("> 400",    lambda v: v >= 400),
+        ]),
+        "net_momentum": win_rate_faixas(rows, "net_momentum_t0", [
+            ("< 0",    lambda v: v < 0),
+            ("0–10",   lambda v: 0  <= v < 10),
+            ("10–30",  lambda v: 10 <= v < 30),
+            ("30–60",  lambda v: 30 <= v < 60),
+            ("> 60",   lambda v: v >= 60),
+        ]),
+    }
+
 
 # ──────────────────────────────────────────────────────────
 # FORMATAÇÃO TERMINAL
@@ -316,6 +426,43 @@ def fmt_terminal(rows, ts):
         cols = "  ".join(_fmt_r(f, tgt) for tgt in TARGETS)
         linhas.append(f"  {f['feature']:<22}  {cols}")
 
+    # 7. Perfil winner vs loser
+    linhas.append(f"\n{'─'*70}")
+    linhas.append("  PERFIL DE ENTRADA — WINNER (>50%) vs LOSER (<-50%)")
+    linhas.append(f"{'─'*70}")
+    perfil, n_win, n_los = analise_perfil_entrada(rows)
+    linhas.append(f"  Winners: {n_win}  |  Losers: {n_los}")
+    linhas.append(f"  {'Feature':<22} {'W_med':>8}  {'W_n':>5}  {'L_med':>8}  {'L_n':>5}  {'Diff':>7}  Direção")
+    linhas.append(f"  {'─'*22} {'─'*8}  {'─'*5}  {'─'*8}  {'─'*5}  {'─'*7}  {'─'*16}")
+    for p in perfil:
+        linhas.append(
+            f"  {p['feature']:<22} {str(p['w_med'] or '—'):>8}  {p['w_n']:>5}  "
+            f"{str(p['l_med'] or '—'):>8}  {p['l_n']:>5}  {str(p['diff'] or '—'):>7}  {p['sinal']}"
+        )
+
+    # 8. Win rate por faixas críticas
+    linhas.append(f"\n{'─'*60}")
+    linhas.append("  WIN RATE POR FAIXAS (condições de entrada)")
+    linhas.append(f"{'─'*60}")
+    faixas = analise_faixas_criticas(rows)
+    for feat_nome, dados in faixas.items():
+        if not dados:
+            continue
+        linhas.append(f"\n  [{feat_nome}]")
+        linhas.append(f"  {'Faixa':<14} {'N':>5}  {'Win>50%':>8}  {'Mediana':>8}")
+        linhas.append(f"  {'─'*14} {'─'*5}  {'─'*8}  {'─'*8}")
+        for d in dados:
+            # destaca a melhor faixa
+            win_val = float(d["win_rate"].rstrip("%")) if d["win_rate"] != "—" else 0
+            star = " ★" if win_val == max(
+                float(x["win_rate"].rstrip("%")) if x["win_rate"] != "—" else 0
+                for x in dados
+            ) else ""
+            linhas.append(
+                f"  {d['faixa']:<14} {d['n']:>5}  {d['win_rate']:>8}  "
+                f"{str(d['mediana'] or '—'):>8}{star}"
+            )
+
     linhas.append(f"\n{'═'*60}\n")
     return "\n".join(linhas)
 
@@ -348,6 +495,22 @@ def fmt_telegram(rows, ts):
                 parts.append(f"{tgt}:{t['r']:+.3f}(n={t['n']})")
         if parts:
             msg += f"• {f['feature']}: {' | '.join(parts)}\n"
+
+    # Resumo winner vs loser
+    perfil, n_win, n_los = analise_perfil_entrada(rows)
+    msg += f"\n<b>Winner vs Loser (n={n_win} vs n={n_los})</b>\n"
+    for p in perfil[:6]:
+        if p["diff"] is not None:
+            msg += f"• {p['feature']}: W={p['w_med']} L={p['l_med']} ({p['sinal']})\n"
+
+    # Melhores faixas por feature
+    faixas = analise_faixas_criticas(rows)
+    msg += "\n<b>Melhor faixa por feature</b>\n"
+    for feat_nome, dados in faixas.items():
+        if not dados:
+            continue
+        melhor = max(dados, key=lambda x: float(x["win_rate"].rstrip("%")) if x["win_rate"] != "—" else 0)
+        msg += f"• {feat_nome} [{melhor['faixa']}] → win={melhor['win_rate']} (n={melhor['n']})\n"
 
     return msg
 
@@ -386,11 +549,13 @@ def fmt_html(rows, ts):
 <title>Dashboard de Performance — {ts}</title>
 <style>
   body {{ font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }}
-  h1, h2 {{ color: #58a6ff; }}
+  h1, h2, h3 {{ color: #58a6ff; }}
   table {{ margin-bottom: 20px; }}
   th {{ background: #21262d; color: #58a6ff; }}
   td, th {{ border-color: #30363d; padding: 6px 12px; }}
   tr:nth-child(even) {{ background: #161b22; }}
+  .highlight {{ background: #1f3a1f !important; color: #3fb950; font-weight: bold; }}
+  .warn {{ color: #f85149; }}
 </style>
 </head>
 <body>
@@ -448,6 +613,45 @@ def fmt_html(rows, ts):
         for f in multi_corr
     ]
     html += tabela({"feature":"Feature","var_pico":"var_pico","var_t1":"var_t1","var_t2":"var_t2","var_t3":"var_t3"}, corr_rows)
+
+    # Perfil winner vs loser
+    html += "<h2>Perfil de Entrada — Winner vs Loser</h2>\n"
+    perfil, n_win, n_los = analise_perfil_entrada(rows)
+    html += f"<p>Winners (var_pico &gt; 50%): <b>{n_win}</b> &nbsp;|&nbsp; Losers (var_pico &lt; -50%): <b>{n_los}</b></p>\n"
+    perfil_rows = [
+        {
+            "feature": p["feature"],
+            "W_med (n)": f"{p['w_med']} (n={p['w_n']})" if p['w_med'] is not None else "—",
+            "L_med (n)": f"{p['l_med']} (n={p['l_n']})" if p['l_med'] is not None else "—",
+            "Diff":      str(p["diff"]) if p["diff"] is not None else "—",
+            "Direção":   p["sinal"],
+        }
+        for p in perfil
+    ]
+    html += tabela({"feature":"Feature","W_med (n)":"Winner Med","L_med (n)":"Loser Med","Diff":"Diff","Direção":"Direção"}, perfil_rows)
+
+    # Win rate por faixas
+    html += "<h2>Win Rate por Faixas Críticas</h2>\n"
+    faixas = analise_faixas_criticas(rows)
+    for feat_nome, dados in faixas.items():
+        if not dados:
+            continue
+        html += f"<h3>{feat_nome}</h3>\n"
+        max_win = max(
+            (float(d["win_rate"].rstrip("%")) if d["win_rate"] != "—" else 0)
+            for d in dados
+        )
+        # adiciona flag de melhor faixa
+        dados_html = []
+        for d in dados:
+            win_val = float(d["win_rate"].rstrip("%")) if d["win_rate"] != "—" else 0
+            dados_html.append({
+                "faixa":    d["faixa"] + (" ★" if win_val == max_win else ""),
+                "n":        d["n"],
+                "win_rate": d["win_rate"],
+                "mediana":  d["mediana"],
+            })
+        html += tabela({"faixa":"Faixa","n":"N","win_rate":"Win >50%","mediana":"Mediana%"}, dados_html)
 
     html += "</body></html>"
     return html
