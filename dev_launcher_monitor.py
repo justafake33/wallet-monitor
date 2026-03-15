@@ -14,7 +14,9 @@ from flask import Flask, request, jsonify
 HELIUS_API_KEY  = os.environ.get("HELIUS_API_KEY", "")
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT   = os.environ.get("TELEGRAM_CHAT", "")
-DATABASE_URL    = os.environ.get("DATABASE_URL", "")
+# Prefere PUBLIC URL pois railway.internal pode não resolver (private networking)
+DATABASE_URL    = (os.environ.get("DATABASE_PUBLIC_URL") or
+                   os.environ.get("DATABASE_URL") or "")
 WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")
 
 DEV_WALLETS     = {
@@ -603,12 +605,20 @@ def health():
     return jsonify({"status": "ok", "ts": datetime.now(timezone.utc).isoformat()})
 
 # ══════════════════════════════════════════════════════════
-# MAIN
+# STARTUP — funciona tanto com gunicorn quanto direto
 # ══════════════════════════════════════════════════════════
+def _startup():
+    if DATABASE_URL:
+        try:
+            init_db()
+        except Exception as e:
+            log(f"⚠️  DB init falhou no startup: {e}")
+    else:
+        log("⚠️  DATABASE_URL não configurado — banco indisponível")
+
+_startup()
+
 if __name__ == "__main__":
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurado")
-    init_db()
     port = int(os.environ.get("PORT", 5001))
     log(f"🚀 dev-launcher-monitor iniciando na porta {port}")
     app.run(host="0.0.0.0", port=port)
